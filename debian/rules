@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+# goblin-view: a plain Makefile with PREFIX/DESTDIR; dh does the rest.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/buildflags.mk
+export CXXFLAGS += -std=c++23
+export CPPFLAGS += -Isrc
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) CXX=g++ CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' goblin-view
+
+# The install target recompiles with the data directory baked in.
+override_dh_auto_install:
+	$(MAKE) install CXX=g++ CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' \
+	    PREFIX=/usr DESTDIR=$(CURDIR)/debian/goblin-view
+
+# Unit tests, the socket-level skeleton, and the end-to-end pty tests;
+# not tools/track-tmux, which needs a checkout that only exists upstream.
+override_dh_auto_test:
+	$(MAKE) CXX=g++ CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' \
+	    test-desktop test-host test-menu test-term test-im test-codec
+	./test-desktop && ./test-host && ./test-menu && ./test-term && \
+	    ./test-im && ./test-codec
+	HOME=$(CURDIR)/debian/tmp-home sh regress/skeleton.sh
+	HOME=$(CURDIR)/debian/tmp-home python3 regress/e2e.py
+
+override_dh_auto_clean:
+	$(MAKE) clean
+	rm -rf debian/tmp-home

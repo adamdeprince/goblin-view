@@ -1,0 +1,107 @@
+#!/bin/sh
+# Compare ~/dev/tmux (or $TMUX_SRC) against docs/tmux-tracking.manifest.
+#   tools/track-tmux          check (default); exit 1 on drift
+#   tools/track-tmux pin      rewrite hashes from the current tree
+#   tools/track-tmux show     print pinned commit and current SHA
+set -e
+
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+MANIFEST="$ROOT/docs/tmux-tracking.manifest"
+TMUX_SRC=${TMUX_SRC:-$HOME/dev/tmux}
+CMD=${1:-check}
+
+die() {
+	echo "track-tmux: $*" >&2
+	exit 1
+}
+
+[ -d "$TMUX_SRC/.git" ] || die "no git repo at TMUX_SRC=$TMUX_SRC"
+[ -f "$MANIFEST" ] || die "missing $MANIFEST"
+
+current_commit=$(git -C "$TMUX_SRC" rev-parse HEAD)
+current_branch=$(git -C "$TMUX_SRC" rev-parse --abbrev-ref HEAD)
+
+file_hash() {
+	# portable sha256
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		shasum -a 256 "$1" | awk '{print $1}'
+	fi
+}
+
+pinned_commit=$(awk '$1=="commit"{print $2; exit}' "$MANIFEST")
+pinned_branch=$(awk '$1=="branch"{print $2; exit}' "$MANIFEST")
+
+case "$CMD" in
+show)
+	echo "pinned  $pinned_commit ($pinned_branch)"
+	echo "current $current_commit ($current_branch)"
+	echo "src     $TMUX_SRC"
+	exit 0
+	;;
+pin)
+	tmp=$(mktemp)
+	{
+		echo "# Machine-readable pin of ~/dev/tmux (override with TMUX_SRC)."
+		echo "# Updated by: tools/track-tmux pin"
+		echo "# Checked by: tools/track-tmux"
+		echo "#"
+		echo "commit $current_commit"
+		echo "branch $current_branch"
+		awk '$1=="file"{print $2}' "$MANIFEST" | while IFS= read -r rel; do
+			[ -n "$rel" ] || continue
+			p="$TMUX_SRC/$rel"
+			[ -f "$p" ] || die "cannot pin missing $rel"
+			echo "file $rel $(file_hash "$p")"
+		done
+	} >"$tmp"
+	mv "$tmp" "$MANIFEST"
+	echo "pinned $current_commit ($current_branch)"
+	exit 0
+	;;
+check|"")
+	;;
+*)
+	die "usage: tools/track-tmux [check|pin|show]"
+	;;
+esac
+
+status=0
+
+if [ "$current_commit" != "$pinned_commit" ]; then
+	echo "DRIFT commit: pinned $pinned_commit, current $current_commit ($current_branch)"
+	status=1
+fi
+if [ "$current_branch" != "$pinned_branch" ]; then
+	echo "DRIFT branch: pinned $pinned_branch, current $current_branch"
+	status=1
+fi
+
+awk '$1=="file"{print $2, $3}' "$MANIFEST" | while IFS= read -r line; do
+	rel=${line%% *}
+	want=${line#* }
+	p="$TMUX_SRC/$rel"
+	if [ ! -f "$p" ]; then
+		echo "DRIFT missing: $rel"
+		echo drift >>"$ROOT/.track-tmux-drift"
+		continue
+	fi
+	got=$(file_hash "$p")
+	if [ "$got" != "$want" ]; then
+		echo "DRIFT $rel"
+		echo "  pinned  $want"
+		echo "  current $got"
+		echo drift >>"$ROOT/.track-tmux-drift"
+	fi
+done
+
+if [ -f "$ROOT/.track-tmux-drift" ]; then
+	rm -f "$ROOT/.track-tmux-drift"
+	status=1
+fi
+
+if [ "$status" -eq 0 ]; then
+	echo "ok $current_commit ($current_branch)"
+fi
+exit "$status"

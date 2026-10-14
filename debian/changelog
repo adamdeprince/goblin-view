@@ -1,0 +1,9 @@
+goblin-view (0.1.0) stable; urgency=medium
+
+  * First packaged release: overlapping windows, the Alt-tap menu, the
+    mouse, detach and reattach, kitty and sixel images re-emitted for the
+    terminal you attach from, input methods, and the kitty protocol
+    extensions per window (keyboard, colours, pointer shapes, extra
+    cursors, drag and drop, file transfer).
+
+ -- Adam DePrince <adam.deprince@gmail.com>  Thu, 10 Sep 2026 22:30:00 +0000

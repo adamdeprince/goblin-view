@@ -1,0 +1,66 @@
+class GoblinView < Formula
+  desc "Terminal multiplexer with overlapping windows and an Alt-tap menu"
+  homepage "https://brew.goblinreactor.com/"
+  url "https://brew.goblinreactor.com/sources/goblin-view-@VERSION@.tar.gz"
+  version "@VERSION@"
+  sha256 "@SOURCE_SHA256@"
+  license all_of: ["Apache-2.0", "MIT", "Unicode-DFS-2016"]
+
+  # The archive is a reviewed release snapshot, not a moving branch.
+  livecheck do
+    skip "Release snapshots are published by the Goblin Reactor maintainer"
+  end
+
+@BOTTLE_BLOCK@
+  uses_from_macos "zlib"
+
+  # The unit tests open Unix sockets and POSIX shared memory on this machine
+  # only; Homebrew counts that as network access. No test contacts a host.
+  allow_network_access! [:build, :test]
+
+  def install
+    system "make", "goblin-view"
+    # The self-contained unit tests: the terminal emulator, the host input
+    # parser, the compositor, input methods, and the image codecs.
+    tests = %w[test-desktop test-host test-menu test-term test-im test-codec]
+    system "make", *tests
+    tests.each { |t| system "./#{t}" }
+    # install recompiles with the fallback data directory baked in; a
+    # relative one keeps the binary free of this prefix, so the bottle is
+    # relocatable. At run time the binary looks beside itself first.
+    system "make", "install", "PREFIX=#{prefix}", "DATADIR_COMPILED=../share/goblin-view"
+    doc.install "README.md", "LICENSE", "NOTICE", "docs/keys.md", "docs/ghostty.md",
+                "docs/CLEANROOM.md"
+  end
+
+  def caveats
+    <<~EOS
+      Run goblin-view in a terminal to attach to a session. Tap Alt (Option)
+      and let go to open the menu, then a letter: O opens a window, ? shows
+      help. Ghostty on macOS needs, in ~/.config/ghostty/config:
+        macos-option-as-alt = true
+      Ctrl-\\ opens the menu on a terminal that swallows the Option tap.
+      Manuals: man goblin-view, man goblin-view-protocols.
+      A running server is upgraded in place the next time a newer
+      goblin-view attaches (or run `goblin-view upgrade`).
+    EOS
+  end
+
+  test do
+    version_output = shell_output("#{bin}/goblin-view -V")
+    assert_match "goblin-view 0.1.0", version_output
+    # The installed binary finds its dictionaries beside itself.
+    assert_match "share/goblin-view", version_output
+    assert_path_exists Pathname(version_output[/data directory: (.*)$/, 1])/"pinyin.dict"
+    assert_path_exists man1/"goblin-view.1"
+    assert_path_exists man7/"goblin-view-protocols.7"
+    assert_path_exists pkgshare/"pinyin.dict"
+    # A detached session and a scripted menu key, on a socket of our own.
+    sock = testpath/"sock"
+    system bin/"goblin-view", "-S", sock, "new-session", "-s", "t", "-d",
+           "-x", "100", "-y", "30", "--", "sleep", "30"
+    system bin/"goblin-view", "-S", sock, "menu", "o"
+    assert_equal 2, shell_output("#{bin}/goblin-view -S #{sock} list-windows -s t").lines.count
+    system bin/"goblin-view", "-S", sock, "kill-server"
+  end
+end

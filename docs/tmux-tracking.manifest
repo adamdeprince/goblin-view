@@ -1,0 +1,15 @@
+# Machine-readable pin of ~/dev/tmux (override with TMUX_SRC).
+# Updated by: tools/track-tmux pin
+# Checked by: tools/track-tmux
+#
+commit 76038e6e91fc0a6bc7e8350d7ac5e72b2d1df2c0
+branch kitty-graphics
+file image-kitty.c c5d68c10734a15c2c54fc96cb79bbe8d5a52f177dc5f503246492e1fa948d7c9
+file image.c aa9c8ce1ab182ca0bb9089ff309eecf4e92fe14177ba89115912644beebaf0b7
+file tty.c 879e46b85372a6053f0831edc74442c802eddc46938c839c302d64fc073d521d
+file tty-keys.c 723b3b46d6aeac47eff2e664d263f0aefa4b669f0df4629dbb2c8bc683ef9bd2
+file tty-features.c 1db817ea1a9425df51a1b4490df8da013f612b5fc3207cb8878f892971d10640
+file input.c 2e9eef7e2876894138372011da2a40017769d1a95912c7243074ff65eb3a944d
+file tmux.h ade612a3c08b0c7f19de336f041d6bc7674ebc5e1f1687dc0272004424349542
+file resize.c 821906ee311cd590d3a7d8cb504a24887c6fcc10d4f5b7a34864650371f8874b
+file regress/kitty-graphics.sh 2ce5df1986b3ca583699bc728b0a3e738f6a745eaf4b609f0ff0c7467716e3f6

@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=docker.io/library/debian:12
+FROM ${BASE_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential debhelper devscripts fakeroot ca-certificates \
+    zlib1g-dev python3 procps file mandoc zsh bash
+COPY snapshot.tar.gz /tmp/goblin-snapshot.tar.gz
+COPY build-release.sh /usr/local/bin/goblin-package-build
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/goblin-package-build"]

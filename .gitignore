@@ -1,0 +1,35 @@
+/goblin-view
+/test-codec
+/test-config
+/test-desktop
+/test-host
+/test-im
+/test-menu
+/test-pointer
+/test-silkie
+/test-term
+*.dSYM
+*.o
+*.a
+src/*.o
+src/tmuxport/*.o
+.DS_Store
+/tmp
+*.log
+.track-tmux-drift
+__pycache__/
+*.pyc
+
+# WordPerfect documents and recovery files (local only)
+*.wp
+*.wpd
+*.WP
+*.WPD
+UNTITLED.WP
+*.wp51-backups/
+
+# input-method source data (fetched by tools/gen-imdata.py --download)
+share/pinyin.txt
+share/wubi86_jidian.dict.yaml
+share/Unihan_Readings.txt
+share/Unihan.zip
