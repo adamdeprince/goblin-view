@@ -40,20 +40,22 @@ type(struct dv_im *im, const char *keys)
 static void
 test_datadir(void)
 {
-	char	probe[1200];
+	char	*probe;
 
-	setenv("GOBLIN_VIEW_IMDATA", "/nonexistent/override", 1);
+	setenv("ODIN_SEAT_IMDATA", "/nonexistent/override", 1);
 	if (strcmp(dv_im_datadir(), "/nonexistent/override") != 0)
-		fail("GOBLIN_VIEW_IMDATA overrides the data directory");
-	unsetenv("GOBLIN_VIEW_IMDATA");
-	snprintf(probe, sizeof probe, "%s/pinyin.dict", dv_im_datadir());
+		fail("ODIN_SEAT_IMDATA overrides the data directory");
+	unsetenv("ODIN_SEAT_IMDATA");
+	probe = xasprintf("%s/pinyin.dict", dv_im_datadir());
 	if (access(probe, R_OK) != 0)
 		fail("the resolved data directory holds pinyin.dict");
+	free(probe);
 	{
-		char	exe[1024];
+		char	*exe = dv_exe_path();
 
-		if (!dv_exe_path(exe, sizeof exe) || strstr(exe, "test-im") == NULL)
+		if (exe == nullptr || strstr(exe, "test-im") == NULL)
 			fail("dv_exe_path names this executable");
+		free(exe);
 	}
 }
 
@@ -62,8 +64,6 @@ main(void)
 {
 	test_datadir();
 	struct dv_im	im;
-
-	setenv("GOBLIN_VIEW_IMDATA", "share", 0);
 
 	memset(&im, 0, sizeof im);
 

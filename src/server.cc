@@ -3,6 +3,9 @@
  */
 
 #include "dv.hpp"
+#include "pstatus.hpp"
+#include "agent.hpp"
+#include "notification_route.hpp"
 #include "pointer_coordinates.hpp"
 #include "silkie.hpp"
 
@@ -13,8 +16,11 @@
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <new>
 #include <poll.h>
 #include <signal.h>
+#include <stdexcept>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -23,6 +29,7 @@ struct dv_server	*dv_srv;
 static int		 dv_quit;
 
 static void	compose_send(struct dv_session *);
+static void focus_window(struct dv_session *, struct dv_window *);
 static void	uni_insert(struct dv_session *, uint32_t);
 static void	win_local(struct dv_window *, int, int, int *, int *);
 static void	copy_selection(struct dv_session *);
@@ -36,6 +43,28 @@ redraw(struct dv_session *s)
 	s->dirty = 1;
 }
 
+/* A menu key refreshes its terminal; a script refreshes the session's displays. */
+static void
+redraw_screen(struct dv_session *s, struct dv_peer *p)
+{
+	struct dv_peer	*q;
+
+	TAILQ_FOREACH(q, &dv_srv->peers, entry) {
+		if (!q->display || q->session != s)
+			continue;
+		if (p != nullptr && p->display && q != p)
+			continue;
+		q->view.full = 1;	/* which sends layered images again too */
+		if (q->view.kimg_gen != nullptr)
+			q->view.kimg_gen->clear();
+		if (q->view.kimg_depth != nullptr)
+			q->view.kimg_depth->clear();
+		free(q->view.xcur_last);
+		q->view.xcur_last = nullptr;
+	}
+	redraw(s);
+}
+
 static long long
 now_ms(void)
 {
@@ -45,10 +74,27 @@ now_ms(void)
 	return ((long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+/*
+ * Signals wake the event loop through a pipe, so the loop can sleep for as
+ * long as nothing happens: a signal arriving just before poll() is not lost.
+ */
+static int	sig_pipe[2] = { -1, -1 };
+
+static void
+sig_wake(void)
+{
+	int	saved = errno;
+
+	if (sig_pipe[1] >= 0)
+		(void)!write(sig_pipe[1], "", 1);
+	errno = saved;
+}
+
 static void
 on_sigchld(int sig)
 {
 	(void)sig;
+	sig_wake();
 }
 
 static void
@@ -56,6 +102,7 @@ on_sigterm(int sig)
 {
 	(void)sig;
 	dv_quit = 1;
+	sig_wake();
 }
 
 static unsigned
@@ -72,59 +119,100 @@ get_u16(const unsigned char **p, const unsigned char *end, int *err)
 	return (v);
 }
 
+static void refresh_focus(struct dv_session *s)
+{
+    bool focused = false;
+    struct dv_peer *peer;
+    TAILQ_FOREACH(peer, &dv_srv->peers, entry)
+        if (peer->display && peer->session == s && !peer->host_unfocused) focused = true;
+    s->host_unfocused = !focused;
+    struct dv_window *window;
+    TAILQ_FOREACH(window, &s->desktop.windows, entry) dv_window_report_focus(window);
+}
+
 static void	refresh_gfx(struct dv_session *);
+static void	recalculate_size(struct dv_session *);
+static void	snap_window(struct dv_session *, struct dv_window *, int);
 static void pointer_cancel_peer(struct dv_peer *);
 static void handle_pointer(struct dv_peer *, const goblin::pointer::Message &);
 
 static void
 peer_close(struct dv_peer *p)
 {
+	dv_agent_detach(p);
 	pointer_cancel_peer(p);
+	dv_kitty_peer_gone(p);
+	dv_silkie_ink_peer_gone(p);
 	if (p->session != NULL && p->display) {
 		p->display = 0;
 		refresh_gfx(p->session);
+		refresh_focus(p->session);
+		/* The terminals left may be larger, or draw a finer cell. */
+		recalculate_size(p->session);
 	}
 	TAILQ_REMOVE(&dv_srv->peers, p, entry);
+	dv_silkie_free_peer(p);
 	dv_view_free(&p->view);
+	dv_buf_free(&p->agent_input);
 	dv_conn_free(&p->conn);
 	if (p->fd >= 0)
 		close(p->fd);
 	free(p);
 }
 
+/*
+ * The size of a session shown by several terminals at once. Each attribute
+ * goes its own way:
+ *
+ * Rows and columns are the SMALLEST of them in each dimension, as in tmux:
+ * every terminal then shows the whole desktop, and none has a part of it
+ * the others cannot see.
+ *
+ * The pixels in a cell are those of the terminal with the MOST of them,
+ * among the terminals that can show a picture at all (any terminal when
+ * none can). Programs draw for that cell; a terminal with a smaller one is
+ * sent each picture scaled down to its own (dv_view.cell_w). The pair comes
+ * from one terminal, never the width of one and the height of another, so
+ * that one terminal at least shows every pixel as it was drawn.
+ */
 static void
 recalculate_size(struct dv_session *s)
 {
 	struct dv_peer	*p;
 	struct dv_size	 sz;
-	int		 any = 0;
+	int		 any = 0, best_gfx = -1;
+	uint64_t	 best_px = 0;
 
 	memset(&sz, 0, sizeof sz);
 	s->pointer_caps = 0;
 	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		int		gfx;
+		uint64_t	px;
+
 		if (!p->display || p->session != s)
 			continue;
 		s->pointer_caps |= p->pointer_caps;
-		if (!any) {
-			sz = p->tty;
-			any = 1;
-			continue;
-		}
-		/* Size to the LARGEST client; smaller ones scroll a viewport. */
-		if (p->tty.cols > sz.cols)
+		if (p->tty.cols != 0 && (sz.cols == 0 || p->tty.cols < sz.cols))
 			sz.cols = p->tty.cols;
-		if (p->tty.rows > sz.rows)
+		if (p->tty.rows != 0 && (sz.rows == 0 || p->tty.rows < sz.rows))
 			sz.rows = p->tty.rows;
-		if (p->tty.xpixel != 0)
+		any = 1;
+		if (p->tty.xpixel == 0 || p->tty.ypixel == 0)
+			continue;
+		gfx = (p->features & (DV_IDENT_KITTY_GFX | DV_IDENT_SIXEL)) != 0;
+		px = (uint64_t)p->tty.xpixel * p->tty.ypixel;
+		if (gfx > best_gfx || (gfx == best_gfx && px > best_px)) {
+			best_gfx = gfx;
+			best_px = px;
 			sz.xpixel = p->tty.xpixel;
-		if (p->tty.ypixel != 0)
 			sz.ypixel = p->tty.ypixel;
+		}
 	}
 	if (!any)
 		return;
-	if (sz.cols < 2)
+	if (sz.cols == 0)
 		sz.cols = 80;
-	if (sz.rows < 2)
+	if (sz.rows == 0)
 		sz.rows = 24;
 	if (sz.xpixel == 0)
 		sz.xpixel = DV_DEFAULT_XPIXEL;
@@ -137,6 +225,8 @@ recalculate_size(struct dv_session *s)
 		TAILQ_FOREACH(w, &s->desktop.windows, entry)
 			dv_window_set_pty_size(w);
 	}
+	/* Pictures made for the terminals as they were are made again. */
+	dv_kitty_packs_forget(s);
 	redraw(s);
 }
 
@@ -209,7 +299,7 @@ static void flush_paste(struct dv_session *s, struct dv_window *w);
  * Drag and drop (kitty OSC 72). The host reports the drag by cell; the
  * window under it is found and the event translated into that window's
  * own cells and handed to its program if it said it takes drops (t=a).
- * Otherwise goblin-view takes the drop on the window's behalf: it asks
+ * Otherwise odin-seat takes the drop on the window's behalf: it asks
  * the host for the text (file paths, or plain text), and pastes it into
  * that window -- the one the drop landed on, at its location, not merely
  * the focused one.
@@ -596,6 +686,7 @@ handle_osc_reply(struct dv_peer *p, unsigned char *payload, size_t len)
 	int			 slot = -1;
 
     if (s == nullptr || len == 0) return;
+    if (dv_agent_reply(p, (const char *)payload, len)) return;
     goblin::pointer::Message pointer;
     if (goblin::pointer::parse(std::string_view(reinterpret_cast<const char *>(payload),len),pointer)) {
         if (pointer.op==goblin::pointer::Op::Event) handle_pointer(p,pointer);
@@ -620,8 +711,24 @@ handle_osc_reply(struct dv_peer *p, unsigned char *payload, size_t len)
 		bn -= 1;
 	for (ml = 0; ml < bn && body[ml] != ';'; ml++)
 		;
-	if (num == 99)
-		idl = dv_meta_val(body, ml, "i", id, sizeof id);
+    if (num == 99 && s->notification_scope) {
+        try {
+            auto result = odin_notification::reply(s->notification_scope, std::string_view(body, bn));
+            if (result.handled) {
+                w = dv_window_find(s, result.window);
+                if (w && w->pty_fd >= 0) {
+                    if (result.focus) {
+                        w->hidden = w->aside = 0;
+                        focus_window(s, w);
+                    }
+                    if (result.deliver) dv_window_pty_send(w, result.bytes.data(), result.bytes.size());
+                }
+                return;
+            }
+        } catch (const std::invalid_argument &) { return; }
+          catch (const std::exception &error) { dv_fatal("notification reply: %s", error.what()); }
+    }
+    if (num == 99) return; /* Never guess an unrouteable click onto the focused window. */
 	else if (num == 5522)
 		idl = dv_meta_val(body, ml, "id", id, sizeof id);
 	else if (num == 5113 || num == 777)
@@ -661,19 +768,70 @@ handle_osc_reply(struct dv_peer *p, unsigned char *payload, size_t len)
 		w = s->desktop.focused;	/* unsolicited: best guess */
 	if (w == nullptr || w->pty_fd < 0)
 		return;
+	if (num == 22) {		/* an image shape: the program's id, not ours */
+		struct dv_buf	shape;
+
+		memset(&shape, 0, sizeof shape);
+		dv_kitty_pointer_reply(w, (const char *)payload, len, &shape);
+		dv_window_pty_send(w, shape.data, shape.len);
+		dv_buf_free(&shape);
+		return;
+	}
 	dv_window_pty_send(w, payload, len);
+}
+
+/*
+ * A program that brackets its drawing in synchronized output (mode 2026)
+ * means none of it to be seen until the update ends. While one is under way
+ * in a window on show its session is not drawn, for this long at most: a
+ * program that never ends its update must not freeze the rest. The time is a
+ * guard against that, not a size; an update is drawn the moment it ends.
+ */
+#define DV_SYNC_HOLD_MS	150
+
+/* How long this session's frame is still held for an update: 0, not at all. */
+static int
+sync_hold(struct dv_session *s, long long now)
+{
+	struct dv_window	*w;
+	long long		 left = 0;
+
+	TAILQ_FOREACH(w, &s->desktop.windows, entry) {
+		if (w->sync_since == 0 || w->hidden || w->aside)
+			continue;
+		if (now - w->sync_since < DV_SYNC_HOLD_MS)
+			left = std::max(left, DV_SYNC_HOLD_MS - (now - w->sync_since));
+	}
+	return ((int)left);
 }
 
 static void
 broadcast_pty(struct dv_window *w, const void *buf, size_t n)
 {
-	dv_vt_write(w, buf, n);
-	flush_host_out(w);
-	if (w->resize_req) {		/* the program asked for a new size */
-		w->resize_req = 0;
-		dv_window_resize_to(w, w->req_cols, w->req_rows);
+	const unsigned char	*p = static_cast<const unsigned char *>(buf);
+
+	while (n > 0) {
+		int	ended = 0;
+		size_t	used = dv_vt_write_frame(w, p, n, &ended);
+
+		p += used;
+		n -= used;
+		flush_host_out(w);
+		if (w->resize_req) {		/* the program asked for a new size */
+			w->resize_req = 0;
+			dv_window_resize_to(w, w->req_cols, w->req_rows);
+		}
+		redraw(w->session);
+		if (w->screen.sync) {
+			if (w->sync_since == 0)
+				w->sync_since = now_ms();
+		} else
+			w->sync_since = 0;
+		/* An update ended: this is the frame, before what follows it
+		 * in the same read begins the next. */
+		if (ended && sync_hold(w->session, now_ms()) == 0)
+			compose_send(w->session);
 	}
-	redraw(w->session);
 }
 
 static void
@@ -690,7 +848,7 @@ compute_viewport(struct dv_session *s, struct dv_peer *p)
 	if (vh < 1)
 		vh = 1;
 	if (f != nullptr && !f->hidden && !f->aside) {
-		int	framed = f->framed && !f->zoomed;
+		int	framed = dv_window_framed(f);
 		int	fx = f->geom.x, fy = f->geom.y;
 		int	fw = (int)dv_frame_cols(&f->geom, framed);
 		int	fh = (int)dv_frame_rows(&f->geom, framed);
@@ -733,25 +891,63 @@ compose_send(struct dv_session *s)
 	struct dv_cell	*desk;
 	unsigned	 W = s->desktop.cols, H = s->desktop.rows;
 
-	if (W == 0 || H == 0)
+	int		 all = s->dirty;
+
+	s->dirty = 0;
+	if (W == 0 || H == 0) {			/* nothing to draw on */
+		TAILQ_FOREACH(p, &dv_srv->peers, entry)
+			if (p->session == s)
+				p->behind = 0;
 		return;
+	}
 	desk = dv_allocn<dv_cell>((size_t)W * H);
 	dv_compose_cells(s, desk);
 	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
 		unsigned char	*frame = nullptr;
 		size_t		 n;
 
-		if (!p->display || p->session != s)
+		if (!p->display || p->session != s || (!all && !p->behind))
 			continue;
 		if (p->conn.out.len > 0) {
-			s->dirty = 1;
+			/* Still writing its last frame: it gets the newest
+			 * once that is out, which wakes the loop. */
+			p->behind = 1;
 			continue;
 		}
+		p->behind = 0;
 		compute_viewport(s, p);
 		p->view.gfx = (p->features & DV_IDENT_KITTY_GFX) != 0;
+		/* Its cells against the ones the programs were told: where
+		 * they differ it is sent pictures scaled to its own. */
+		{
+			unsigned	sw = s->desktop.xpixel ? s->desktop.xpixel : DV_DEFAULT_XPIXEL;
+			unsigned	sh = s->desktop.ypixel ? s->desktop.ypixel : DV_DEFAULT_YPIXEL;
+			unsigned	cw = p->tty.xpixel ? p->tty.xpixel : sw;
+			unsigned	ch = p->tty.ypixel ? p->tty.ypixel : sh;
+
+			if (p->view.cell_w != cw || p->view.cell_h != ch ||
+			    p->view.scell_w != sw || p->view.scell_h != sh) {
+				/* The pictures it holds are at the scale that was. */
+				if (p->view.cell_w != 0)
+					p->view.full = 1;
+				p->view.cell_w = cw;
+				p->view.cell_h = ch;
+				p->view.scell_w = sw;
+				p->view.scell_h = sh;
+			}
+		}
 		p->view.sixel = (p->features & DV_IDENT_SIXEL) != 0;
 		p->view.mcursors = (p->features & DV_IDENT_MCURSORS) != 0;
 		p->view.mono = (p->features & DV_IDENT_MONO) != 0;
+		p->view.mosaic = dv_cfg.cell_pictures && !p->view.gfx &&
+		    !p->view.sixel && !p->view.mono;
+		if (p->view.focus_px != p->focus_px) {
+			/* Another --3d-focus: every focused depth is another. */
+			p->view.focus_px = p->focus_px;
+			delete p->view.focus_depth;
+			p->view.focus_depth = nullptr;
+			p->view.full = 1;
+		}
 		n = dv_compose_frame(s, desk, &p->view, &frame);
 		if (n > 0) {
 			dv_conn_send(&p->conn, DV_MSG_STDOUT, frame, n);
@@ -788,10 +984,11 @@ focus_window(struct dv_session *s, struct dv_window *w)
 }
 
 /*
- * Can any client showing this session display an image, by kitty graphics
- * or by sixel? Only then do the windows advertise graphics to their
- * programs (kitty query, sixel in DA1), since we convert to whatever each
- * client's host speaks. With no client attached the last answer stands.
+ * Can any client showing this session display an image: by kitty graphics,
+ * by sixel, or failing both as coloured cells (cell-pictures, which is on
+ * unless configured off)? Only then do the windows advertise graphics to
+ * their programs (kitty query, sixel in DA1), since we convert to whatever
+ * each client's host speaks. With no client attached the last answer stands.
  */
 static void
 refresh_gfx(struct dv_session *s)
@@ -808,6 +1005,10 @@ refresh_gfx(struct dv_session *s)
 		 * may draw graphics if any attached terminal can display. */
 		if (q->features & (DV_IDENT_KITTY_GFX | DV_IDENT_SIXEL))
 			gfx = 1;
+		/* And one that shows none is drawn them as coloured cells,
+		 * unless it is strictly black and white. */
+		else if (dv_cfg.cell_pictures && !(q->features & DV_IDENT_MONO))
+			gfx = 1;
 	}
 	if (any)
 		s->desktop.gfx = gfx;
@@ -822,9 +1023,12 @@ refresh_gfx(struct dv_session *s)
 static void
 attach_peer(struct dv_peer *p, struct dv_session *s)
 {
+	dv_silkie_ink_peer_gone(p);
 	p->session = s;
 	p->display = 1;
+	dv_agent_attach(p);
 	refresh_gfx(s);
+	refresh_focus(s);
 	dv_silkie_attach(p);
 	p->view.full = 1;
 	p->view.vx = 0;
@@ -872,7 +1076,7 @@ window_at(struct dv_session *s, int x, int y)
 	struct dv_window	*w, *best = nullptr;
 
 	TAILQ_FOREACH(w, &s->desktop.windows, entry) {
-		int	framed = w->framed && !w->zoomed;
+		int	framed = dv_window_framed(w);
 		int	fx = w->geom.x, fy = w->geom.y;
 		int	fw = (int)dv_frame_cols(&w->geom, framed);
 		int	fh = (int)dv_frame_rows(&w->geom, framed);
@@ -887,15 +1091,20 @@ window_at(struct dv_session *s, int x, int y)
 	return (best);
 }
 
-/* Re-encode a mouse event for the inner app's coordinate origin. */
+/* Re-encode a mouse event for the inner app's coordinate origin.
+ * subx/suby are the 0-based pixel inside the host cell, or -1 when the
+ * event only named a cell. host_cw/host_ch are that host's cell size. */
 static void
-forward_mouse(struct dv_window *w, int x, int y, unsigned code, int press)
+forward_mouse(struct dv_window *w, int x, int y, unsigned code, int press,
+    int subx, int suby, unsigned host_cw, unsigned host_ch)
 {
-	int	framed = w->framed && !w->zoomed;
+	int	framed = dv_window_framed(w);
 	int	ix = w->geom.x + (framed ? 1 : 0);
 	int	iy = w->geom.y + (framed ? 1 : 0);
-	int	lx = x - ix + 1 + (int)w->ox;
-	int	ly = y - iy + 1 + (int)w->oy;
+	int	raw_lx = x - ix + 1 + (int)w->ox;
+	int	raw_ly = y - iy + 1 + (int)w->oy;
+	int	lx = raw_lx;
+	int	ly = raw_ly;
 	char	buf[64];
 	int	n;
 
@@ -909,14 +1118,22 @@ forward_mouse(struct dv_window *w, int x, int y, unsigned code, int press)
 		lx = (int)w->screen.cols;
 	if ((unsigned)ly > w->screen.rows)
 		ly = (int)w->screen.rows;
-	if (w->screen.mouse_sgr == 2) {	/* SGR pixels (1016): cell centres */
+	if (w->screen.mouse_sgr == 2) {	/* SGR pixels (1016) */
 		struct dv_desktop	*d = &w->session->desktop;
 		unsigned		 cw = d->xpixel ? d->xpixel : DV_DEFAULT_XPIXEL;
 		unsigned		 chh = d->ypixel ? d->ypixel : DV_DEFAULT_YPIXEL;
 
+		/* A position outside the window reports the edge it crossed. */
+		if (subx >= 0 && raw_lx != lx)
+			subx = raw_lx < lx ? 0 :
+			    (int)(host_cw ? host_cw : cw) - 1;
+		if (suby >= 0 && raw_ly != ly)
+			suby = raw_ly < ly ? 0 :
+			    (int)(host_ch ? host_ch : chh) - 1;
 		n = snprintf(buf, sizeof buf, "\033[<%u;%u;%u%c", code,
-		    (unsigned)(lx - 1) * cw + cw / 2,
-		    (unsigned)(ly - 1) * chh + chh / 2, press ? 'M' : 'm');
+		    goblin::pointer::sgr_pixel(lx, subx, host_cw, cw, w->screen.cols),
+		    goblin::pointer::sgr_pixel(ly, suby, host_ch, chh, w->screen.rows),
+		    press ? 'M' : 'm');
 	} else if (w->screen.mouse_sgr)
 		n = snprintf(buf, sizeof buf, "\033[<%u;%d;%d%c", code, lx, ly,
 		    press ? 'M' : 'm');
@@ -962,7 +1179,7 @@ hover_set(struct dv_session *s, struct dv_window *w)
  * does. On the alternate screen (a pager, an editor) translate each notch
  * into a few arrow keys -- "alternate scroll" -- honouring DECCKM and the
  * app's DECSET 1007. On the primary screen there is nothing to scroll
- * (goblin-view keeps no scrollback), so it is left alone.
+ * (odin-seat keeps no scrollback), so it is left alone.
  */
 static int
 scroll_window(struct dv_window *w, int up)
@@ -997,15 +1214,28 @@ scroll_window(struct dv_window *w, int up)
  */
 static void
 handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
-    unsigned vy, unsigned code, int press)
+    unsigned vy, unsigned code, int press, int have_px = 0, int px = 0,
+    int py = 0)
 {
 	struct dv_window	*w;
 	int			 x, y, motion, wheel, button;
+	int			 subx = -1, suby = -1;
+	unsigned		 host_cw = 0, host_ch = 0;
 
 	if (s == nullptr)
 		return;
 	x = (int)vx - 1 + p->view.vx;
 	y = (int)vy - 1 + p->view.vy;
+	if (have_px && p != nullptr) {
+		host_cw = p->tty.xpixel ? p->tty.xpixel : DV_DEFAULT_XPIXEL;
+		host_ch = p->tty.ypixel ? p->tty.ypixel : DV_DEFAULT_YPIXEL;
+		subx = px % (int)host_cw;
+		suby = py % (int)host_ch;
+		if (subx < 0)
+			subx += (int)host_cw;
+		if (suby < 0)
+			suby += (int)host_ch;
+	}
 	motion = (code & 32) != 0;
 	wheel = (code & 64) != 0;
 	button = (int)(code & 3);
@@ -1029,7 +1259,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 		redraw(s);
 		return;
 	}
-	if (s->menu_open || s->quit_confirm || s->help_open || s->xfer_prompt ||
+	if (s->menu_open || s->quit_confirm || s->kill_confirm || s->input_mode == DV_IN_SPLIT || s->help_open || s->xfer_prompt ||
 	    s->switch_open || s->copy_open)
 		return;			/* overlays own the screen */
 
@@ -1046,7 +1276,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 		if (w == nullptr)
 			return;
 		if (w->screen.mouse)
-			forward_mouse(w, x, y, code, 1);
+			forward_mouse(w, x, y, code, 1, subx, suby, host_cw, host_ch);
 		else if ((code & 3) < 2 &&	/* 64 = up, 65 = down (not horizontal) */
 		    scroll_window(w, (code & 3) == 0))
 			redraw(s);
@@ -1061,7 +1291,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 		}
 		if (!press) {			/* button up ends the drag */
 			if (s->drag == DV_DRAG_FORWARD)
-				forward_mouse(w, x, y, code, 0);
+				forward_mouse(w, x, y, code, 0, subx, suby, host_cw, host_ch);
 			else if (s->drag == DV_DRAG_SELECT) {
 				s->sel_active = 0;
 				if (s->sel_ax == s->sel_cx &&
@@ -1077,7 +1307,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 			return;
 		}
 		if (s->drag == DV_IN_MOVE) {
-			int	framed = w->framed && !w->zoomed;
+			int	framed = dv_window_framed(w);
 			int	chrome = framed ? 2 : 0;
 			int	ox = w->geom.x, oy = w->geom.y;
 			int	nx = x - s->grab_dx, ny = y - s->grab_dy;
@@ -1122,7 +1352,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 				dv_window_set_pty_size(w);
 			redraw(s);
 		} else if (s->drag == DV_IN_RESIZE) {
-			int	framed = w->framed && !w->zoomed;
+			int	framed = dv_window_framed(w);
 			int	chrome = framed ? 2 : 0;
 			int	nc = x - w->geom.x + 1 - chrome;
 			int	nr = y - w->geom.y + 1 - chrome;
@@ -1141,7 +1371,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 			win_local(w, x, y, &s->sel_cx, &s->sel_cy);
 			redraw(s);
 		} else if (s->drag == DV_DRAG_FORWARD)
-			forward_mouse(w, x, y, code, 1);
+			forward_mouse(w, x, y, code, 1, subx, suby, host_cw, host_ch);
 		return;
 	}
 
@@ -1153,7 +1383,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 		w = window_at(s, x, y);
 		hover_set(s, w);
 		if (w != nullptr && w->screen.mouse == 1003)
-			forward_mouse(w, x, y, code, 1);
+			forward_mouse(w, x, y, code, 1, subx, suby, host_cw, host_ch);
 		return;
 	}
 	if (motion || !press)
@@ -1180,11 +1410,11 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 	}
 
 	if (button == 0) {
-		int		framed = w->framed && !w->zoomed;
+		int		framed = dv_window_framed(w);
 		int		fx = w->geom.x, fy = w->geom.y;
 		int		fw = (int)dv_frame_cols(&w->geom, framed);
 		int		fh = (int)dv_frame_rows(&w->geom, framed);
-		int		corner = (x == fx + fw - 1 && y == fy + fh - 1);
+		int		corner = framed && (x == fx + fw - 1 && y == fy + fh - 1);
 		int		border = framed && (x == fx || x == fx + fw - 1 ||
 				    y == fy || y == fy + fh - 1);
 		int		on_title = framed && y == fy && !corner;
@@ -1195,6 +1425,25 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 				    (x - s->last_click_x) < 3 &&
 				    (s->last_click_x - x) < 3;
 
+		/* A control on its top edge: to a half of the desktop, or in
+		 * and out of the selection. Not the start of a drag or a rename. */
+		if (on_title) {
+			int	fb = dv_frame_button((unsigned)fw, (unsigned)(x - fx));
+
+			if (fb == DV_FB_SELECT) {
+				w->selected = !w->selected;
+				s->drag = 0;
+				redraw(s);
+				return;
+			}
+			if (fb != DV_FB_NONE) {
+				s->drag = 0;
+				snap_window(s, w, dv_half_snap(
+				    fb == DV_FB_LEFT ? -1 : fb == DV_FB_RIGHT ? 1 : 0,
+				    fb == DV_FB_UP ? -1 : fb == DV_FB_DOWN ? 1 : 0));
+				return;
+			}
+		}
 		s->last_click_ms = now;
 		s->last_click_win = w->id;
 		s->last_click_x = x;
@@ -1220,7 +1469,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 		} else if (w->screen.mouse && !(code & 4)) {
 			s->drag = DV_DRAG_FORWARD;	/* app wants the mouse */
 			s->drag_win = w->id;
-			forward_mouse(w, x, y, code, 1);
+			forward_mouse(w, x, y, code, 1, subx, suby, host_cw, host_ch);
 		} else {
 			/* Body drag selects text (Shift forces it over an app). */
 			int	sx, sy;
@@ -1238,7 +1487,7 @@ handle_mouse(struct dv_peer *p, struct dv_session *s, unsigned vx,
 		return;
 	}
 	if (w->screen.mouse)
-		forward_mouse(w, x, y, code, 1);
+		forward_mouse(w, x, y, code, 1, subx, suby, host_cw, host_ch);
 }
 
 void
@@ -1251,9 +1500,202 @@ dv_host_passthrough(struct dv_session *s, const char *bytes, size_t n)
 	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
 		if (!p->display || p->session != s)
 			continue;
-		dv_conn_send(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
 		dv_conn_flush(&p->conn);
 	}
+}
+
+struct dv_peer *
+dv_host_first_peer(void)
+{
+	return (dv_srv != nullptr ? TAILQ_FIRST(&dv_srv->peers) : nullptr);
+}
+
+void
+dv_host_send_peer(struct dv_peer *p, const char *bytes, size_t n)
+{
+	dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+	dv_conn_flush(&p->conn);
+}
+
+/* One terminal can answer a question: the first that takes vector images. */
+int
+dv_kitty_send_primary(struct dv_session *s, const char *bytes, size_t n)
+{
+	struct dv_peer	*p;
+
+	if (s == nullptr || dv_srv == nullptr)
+		return (-1);
+	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		if (!p->display || p->session != s || !p->view.vector)
+			continue;
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+		dv_conn_flush(&p->conn);
+		return (p->fd);
+	}
+	return (-1);
+}
+
+/* Fonts a client has not got yet, for it and every client that shows them. */
+static void
+sync_view(struct dv_session *s, struct dv_peer *p)
+{
+	struct dv_buf	b;
+
+	memset(&b, 0, sizeof b);
+	dv_kitty_sync(s, &p->view, &b);
+	if (b.len > 0)
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, b.data, b.len);
+	dv_buf_free(&b);
+}
+
+void
+dv_kitty_sync_views(struct dv_session *s)
+{
+	struct dv_peer	*p;
+
+	if (s == nullptr || dv_srv == nullptr)
+		return;
+	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		if (!p->display || p->session != s)
+			continue;
+		sync_view(s, p);
+		dv_conn_flush(&p->conn);
+	}
+}
+
+/*
+ * An edit of a scene, to the clients that hold this placement at this
+ * generation. One that does not yet will be sent the whole scene, edit
+ * included, when it comes to show it.
+ */
+void
+dv_kitty_send_patch(struct dv_session *s, unsigned dv_id, unsigned gen,
+    const char *bytes, size_t n, const struct dv_peer *except)
+{
+	struct dv_peer	*p;
+
+	if (s == nullptr || dv_srv == nullptr)
+		return;
+	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		if (p == except || !p->display || p->session != s ||
+		    (!p->view.gfx && !p->view.sixel) || p->view.kimg_gen == nullptr)
+			continue;
+		auto it = p->view.kimg_gen->find(dv_id);
+		if (it == p->view.kimg_gen->end() || it->second != gen)
+			continue;
+		if (!p->view.vector || !p->view.gfx) {
+			/* It holds the scene drawn, as pixels or as sixel:
+			 * an edit of the records means nothing to it. It is
+			 * sent it drawn again. */
+			p->view.kimg_gen->erase(it);
+			s->dirty = 1;
+			continue;
+		}
+		sync_view(s, p);
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+		dv_conn_flush(&p->conn);
+	}
+}
+
+/* As an edit of a scene, to one client if it holds the placement as it is. */
+void
+dv_kitty_send_patch_to(const struct dv_peer *q, unsigned dv_id, unsigned gen,
+    const char *bytes, size_t n)
+{
+	struct dv_peer	*p;
+
+	if (dv_srv == nullptr)
+		return;
+	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		if (p != q || !p->display || p->session == nullptr ||
+		    (!p->view.gfx && !p->view.sixel) || p->view.kimg_gen == nullptr)
+			continue;
+		auto it = p->view.kimg_gen->find(dv_id);
+
+		if (it == p->view.kimg_gen->end() || it->second != gen)
+			continue;
+		if (!p->view.vector || !p->view.gfx) {
+			p->view.kimg_gen->erase(it);
+			p->session->dirty = 1;
+			continue;
+		}
+		sync_view(p->session, p);
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+		dv_conn_flush(&p->conn);
+	}
+}
+
+/* The same for the one copy a client holds of a layered window's image. */
+void
+dv_kitty_send_layer_patch(struct dv_session *s, unsigned hid, unsigned was,
+    unsigned now, const char *bytes, size_t n, const struct dv_peer *except,
+    int not_scaled)
+{
+	struct dv_peer	*p;
+
+	if (s == nullptr || dv_srv == nullptr)
+		return;
+	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		if (!p->display || p->session != s || !p->view.gfx ||
+		    p->view.limg_gen == nullptr)
+			continue;
+		auto it = p->view.limg_gen->find(hid);
+
+		if (it == p->view.limg_gen->end() || it->second != was)
+			continue;
+		/* An edit that is not its copy's to take as it is: left
+		 * holding the scene as it was, it is sent it whole again. */
+		if ((not_scaled && dv_view_scaled(&p->view)) || !p->view.vector) {
+			s->dirty = 1;
+			continue;
+		}
+		it->second = now;
+		if (p == except)
+			continue;	/* it made the edit itself */
+		sync_view(s, p);
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+		dv_conn_flush(&p->conn);
+	}
+}
+
+void
+dv_kitty_send_layer_patch_to(const struct dv_peer *q, unsigned hid, unsigned gen,
+    const char *bytes, size_t n)
+{
+	struct dv_peer	*p;
+
+	if (dv_srv == nullptr)
+		return;
+	TAILQ_FOREACH(p, &dv_srv->peers, entry) {
+		if (p != q || !p->display || p->session == nullptr ||
+		    !p->view.gfx || p->view.limg_gen == nullptr)
+			continue;
+		auto it = p->view.limg_gen->find(hid);
+
+		if (it == p->view.limg_gen->end() || it->second != gen)
+			continue;
+		if (!p->view.vector) {
+			p->view.limg_gen->erase(it);
+			p->session->dirty = 1;
+			continue;
+		}
+		sync_view(p->session, p);
+		dv_conn_send_stream(&p->conn, DV_MSG_PASSTHROUGH, bytes, n);
+		dv_conn_flush(&p->conn);
+	}
+}
+
+/* That client's copy has gone wrong: its next frame sends the placement again. */
+void
+dv_kitty_peer_stale(const struct dv_peer *p, unsigned dv_id)
+{
+	if (p->view.limg_gen != nullptr)
+		p->view.limg_gen->erase(dv_id);
+	if (p->view.kimg_gen != nullptr)
+		p->view.kimg_gen->erase(dv_id);
+	if (p->session != nullptr)
+		p->session->dirty = 1;
 }
 
 void
@@ -1278,7 +1720,7 @@ dv_silkie_peers_changed(struct dv_session *s)
 static void
 win_local(struct dv_window *w, int x, int y, int *sx, int *sy)
 {
-	int	framed = w->framed && !w->zoomed;
+	int	framed = dv_window_framed(w);
 
 	*sx = x - (w->geom.x + (framed ? 1 : 0)) + (int)w->ox;
 	*sy = y - (w->geom.y + (framed ? 1 : 0)) + (int)w->oy;
@@ -1337,7 +1779,7 @@ static int pointer_device(struct dv_peer *p, int id)
 static gp::Message pointer_local(struct dv_peer *p, struct dv_window *w, gp::Message m)
 {
     m.device=pointer_device(p,m.device);
-    const bool frame=w->framed && !w->zoomed;
+    const bool frame=dv_window_framed(w);
     const unsigned cw=p->tty.xpixel ? p->tty.xpixel : DV_DEFAULT_XPIXEL;
     const unsigned ch=p->tty.ypixel ? p->tty.ypixel : DV_DEFAULT_YPIXEL;
     const unsigned aw=w->session->desktop.xpixel ? w->session->desktop.xpixel : DV_DEFAULT_XPIXEL;
@@ -1368,7 +1810,7 @@ static void pointer_mouse(struct dv_peer *p, struct dv_window *w, const gp::Mess
     } else {
         const unsigned cw=p->tty.xpixel ? p->tty.xpixel : DV_DEFAULT_XPIXEL;
         const unsigned ch=p->tty.ypixel ? p->tty.ypixel : DV_DEFAULT_YPIXEL;
-        forward_mouse(w,gp::cell_at(event.x,cw)+p->view.vx,gp::cell_at(event.y,ch)+p->view.vy,code,press);
+        forward_mouse(w,gp::cell_at(event.x,cw)+p->view.vx,gp::cell_at(event.y,ch)+p->view.vy,code,press,-1,-1,0,0);
     }
 }
 static void pointer_cancel_peer(struct dv_peer *p)
@@ -1402,7 +1844,7 @@ static void handle_pointer(struct dv_peer *p, const gp::Message &event)
     }
     auto *w=capture ? dv_window_find(s,capture->window) : window_at(s,x,y);
     if (capture && (!w || capture->epoch!=w->pointer_epoch)) { capture->used=0; return; }
-    if (s->menu_open || s->quit_confirm || s->help_open || s->xfer_prompt || s->switch_open || s->copy_open || s->uni_open) {
+    if (s->menu_open || s->quit_confirm || s->kill_confirm || s->input_mode == DV_IN_SPLIT || s->help_open || s->xfer_prompt || s->switch_open || s->copy_open || s->uni_open) {
         pointer_cancel_peer(p); return;
     }
     if (event.kind==gp::Gesture) {
@@ -1415,7 +1857,7 @@ static void handle_pointer(struct dv_peer *p, const gp::Message &event)
         if (!capture) w=first;
     }
     if (!w) return;
-    const bool framed=w->framed && !w->zoomed;
+    const bool framed=dv_window_framed(w);
     const bool content=x>=w->geom.x+int(framed) && y>=w->geom.y+int(framed)
         && x<w->geom.x+int(framed)+int(w->geom.cols) && y<w->geom.y+int(framed)+int(w->geom.rows);
     if (capture && capture->legacy==2) {
@@ -2159,11 +2601,117 @@ list_windows_text(struct dv_session *s)
 			n--;			/* replace the newline */
 			n += snprintf(line + n, sizeof line - (size_t)n, " hidden\n");
 		}
+		if (n > 0 && w->selected && (size_t)n < sizeof line) {
+			n--;
+			n += snprintf(line + n, sizeof line - (size_t)n, " selected\n");
+		}
 		if (n > 0)
 			dv_buf_append(&b, line, (size_t)n);
 	}
 	dv_buf_append(&b, "", 1);
 	return ((char *)b.data);
+}
+
+/* Put a window where a snap recipe says: a half, a quarter, the middle. */
+static void
+snap_window(struct dv_session *s, struct dv_window *w, int snap)
+{
+	struct dv_desktop	*d = &s->desktop;
+
+	if (w == nullptr || snap < 1 || snap > DV_SNAP_COUNT)
+		return;
+	if (w->zoomed)
+		dv_desktop_apply_unzoom(w);
+	dv_snap_geom(d->cols, d->rows, snap, 1, &w->geom);
+	w->framed = 1;
+	w->zoomed = 0;
+	dv_silkie_cancel_window(w);
+	dv_window_set_pty_size(w);
+	redraw(s);
+}
+
+static size_t
+selected_count(const struct dv_session *s)
+{
+	const struct dv_window	*w;
+	size_t			 n = 0;
+
+	TAILQ_FOREACH(w, &s->desktop.windows, entry)
+		n += w->selected != 0;
+	return (n);
+}
+
+/*
+ * Does typing in `from` go to `to` as well? With broadcast on and no window
+ * selected, every window hears every other. With some selected they are a
+ * group: what is typed in one of them goes to them all, and what is typed in
+ * a window outside the group stays there.
+ */
+static int
+broadcast_reaches(const struct dv_session *s, const struct dv_window *from,
+    const struct dv_window *to, size_t nselected)
+{
+	if (!s->broadcast || to == from || to->pty_fd < 0)
+		return (0);
+	return (nselected == 0 || (from->selected && to->selected));
+}
+
+/*
+ * Lay windows out together (menu L): the selected ones, or with none selected
+ * every window that shows. They go in the order of their numbers, are raised
+ * above the windows left alone in the stacking they had, and each program is
+ * told its new size.
+ */
+static void
+tile_windows(struct dv_session *s, int layout)
+{
+	struct dv_desktop		*d = &s->desktop;
+	struct dv_window		*w;
+	std::vector<struct dv_window *>	 set, by_z;
+	size_t				 nsel = selected_count(s);
+
+	TAILQ_FOREACH(w, &d->windows, entry) {
+		if (w->aside || (nsel != 0 ? !w->selected : w->hidden))
+			continue;
+		set.push_back(w);
+	}
+	if (set.empty())
+		return;
+	std::sort(set.begin(), set.end(), [](const auto *a, const auto *b) {
+		return (a->id < b->id);
+	});
+	auto frames = dv_tile_frames(d->cols, d->rows, d->xpixel, d->ypixel,
+	    layout, set.size());
+
+	for (size_t i = 0; i < set.size(); i++) {
+		int	framed;
+
+		w = set[i];
+		w->hidden = 0;			/* chosen by name, it shows */
+		if (w->zoomed)
+			dv_desktop_apply_unzoom(w);
+		w->framed = 1;
+		framed = dv_frame_fits(d->cols, d->rows);
+		w->geom.x = frames[i].x;
+		w->geom.y = frames[i].y;
+		w->geom.cols = framed && frames[i].cols > 2 ? frames[i].cols - 2 :
+		    framed ? 1 : frames[i].cols;
+		w->geom.rows = framed && frames[i].rows > 2 ? frames[i].rows - 2 :
+		    framed ? 1 : frames[i].rows;
+		dv_clamp_geom(d->cols, d->rows, 1, &w->geom);
+		dv_silkie_cancel_window(w);
+		dv_window_set_pty_size(w);
+	}
+	by_z = set;
+	std::sort(by_z.begin(), by_z.end(), [](const auto *a, const auto *b) {
+		return (a->z < b->z);
+	});
+	for (auto *it : by_z)
+		dv_window_raise(it);
+	if (d->focused == nullptr || d->focused->hidden ||
+	    std::find(set.begin(), set.end(), d->focused) == set.end())
+		focus_window(s, by_z.back());
+	redraw(s);
 }
 
 static void
@@ -2227,13 +2775,18 @@ nudge_or_grow(struct dv_session *s, int dx, int dy, int grow)
 static void
 switch_key(struct dv_session *s, const char *arg)
 {
-	unsigned	ids[256], n = dv_switch_list(s, ids, 256);
+	auto		ids = dv_switch_list(s);
+	size_t		n = ids.size();
 	size_t		fl = strlen(s->switch_filter);
 
+	if (n == 0)
+		s->switch_sel = 0;
+	else if (s->switch_sel >= n)
+		s->switch_sel = n - 1;
 	if (strcmp(arg, "esc") == 0 || strcmp(arg, "menu") == 0) {
 		s->switch_open = 0;
 	} else if (strcmp(arg, "enter") == 0) {
-		struct dv_window	*w = n > 0 && (unsigned)s->switch_sel < n ?
+		struct dv_window	*w = n > 0 && s->switch_sel < n ?
 		    dv_window_find(s, ids[s->switch_sel]) : nullptr;
 
 		s->switch_open = 0;
@@ -2241,11 +2794,17 @@ switch_key(struct dv_session *s, const char *arg)
 			w->hidden = 0;
 			focus_window(s, w);
 		}
+	} else if (strcmp(arg, "tab") == 0) {
+		struct dv_window	*w = n > 0 && s->switch_sel < n ?
+		    dv_window_find(s, ids[s->switch_sel]) : nullptr;
+
+		if (w != nullptr)		/* in or out of the selection */
+			w->selected = !w->selected;
 	} else if (strcmp(arg, "up") == 0) {
 		if (s->switch_sel > 0)
 			s->switch_sel--;
 	} else if (strcmp(arg, "down") == 0) {
-		if (n > 0 && (unsigned)s->switch_sel + 1 < n)
+		if (n > 0 && s->switch_sel < n - 1)
 			s->switch_sel++;
 	} else if (strcmp(arg, "backspace") == 0) {
 		if (fl > 0)
@@ -2296,7 +2855,19 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 		return;
 	}
 
-	/* Quit confirmation swallows input until answered. */
+	/* Confirmation belongs to a window id, even if another client focuses
+	 * a different window before the answer arrives. */
+	if (s->kill_confirm) {
+		struct dv_window *target = dv_window_find(s, s->kill_confirm);
+
+		s->kill_confirm = 0;
+		if ((strcmp(arg, "y") == 0 || strcmp(arg, "Y") == 0) && target != nullptr) {
+			dv_pty_kill(target);
+			dv_window_close(target);
+		}
+		redraw(s);
+		return;
+	}
 	if (s->quit_confirm) {
 		char	f = arg[0];
 
@@ -2373,6 +2944,13 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 			nudge_or_grow(s, dx, dy, 0);
 		else if (s->input_mode == DV_IN_RESIZE)
 			nudge_or_grow(s, dx, dy, 1);
+		else if (s->input_mode == DV_IN_REARRANGE) {
+			/* An arrow alone: to that half of the desktop. */
+			s->input_mode = DV_IN_NORMAL;
+			s->menu_open = 0;
+			snap_window(s, w, dv_half_snap(dx, dy));
+			redraw(s);
+		}
 		return;
 	}
 	if (strcmp(arg, "enter") == 0) {
@@ -2384,6 +2962,7 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 		if ((s->input_mode == DV_IN_MOVE ||
 		    s->input_mode == DV_IN_RESIZE) && w != nullptr) {
 			w->geom = s->mode_saved;
+			dv_clamp_geom(d->cols, d->rows, dv_window_framed(w), &w->geom);
 			dv_window_set_pty_size(w);
 		}
 		s->input_mode = DV_IN_NORMAL;
@@ -2425,16 +3004,8 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 			return;
 		}
 		if (letter >= '1' && letter <= '9' && w != nullptr) {
-			if (w->zoomed) {
-				dv_desktop_apply_unzoom(w);
-			}
-			dv_snap_geom(d->cols, d->rows, letter - '0', 1,
-			    &w->geom);
-			w->framed = 1;
-			w->zoomed = 0;
-			dv_window_set_pty_size(w);
 			s->input_mode = DV_IN_NORMAL;
-			redraw(s);
+			snap_window(s, w, letter - '0');
 			return;
 		}
 		if (letter == 0)
@@ -2442,8 +3013,41 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 		/* unknown rearrange key: drop back to normal and fall through */
 		s->input_mode = DV_IN_NORMAL;
 	}
+	if (s->input_mode == DV_IN_SPLIT) {
+		s->input_mode = DV_IN_NORMAL;
+		if (w != nullptr && (letter == 'r' || letter == 'b'))
+			dv_window_split(w, letter == 'b', nullptr, nullptr);
+		redraw(s);
+		return;
+	}
+	if (s->input_mode == DV_IN_TILE) {
+		int	layout = letter == 'f' ? DV_TILE_STACK :
+			    letter == 'g' ? DV_TILE_GRID :
+			    letter == 'h' ? DV_TILE_ROWS :
+			    letter == 'v' ? DV_TILE_COLS :
+			    letter == '2' ? DV_TILE_2COL : 0;
+
+		s->input_mode = DV_IN_NORMAL;
+		if (layout != 0)
+			tile_windows(s, layout);
+		redraw(s);
+		return;
+	}
 
 	switch (letter) {
+	case 'e':
+		if (w != nullptr)
+			s->input_mode = DV_IN_SPLIT;
+		redraw(s);
+		break;
+	case 'k':
+		if (w != nullptr)
+			s->kill_confirm = w->id;
+		redraw(s);
+		break;
+	case 'f':	/* recover a damaged host display, including its images */
+		redraw_screen(s, p);
+		break;
 	case 'o':
 		if (dv_window_open(s, NULL, NULL, (int)d->next_snap,
 		    p != nullptr ? p->cwd : nullptr) != NULL)
@@ -2505,6 +3109,7 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 				    (next == nullptr || it->z > next->z))
 					next = it;
 			d->focused = next;
+			dv_silkie_focus(s, w);
 			if (next != nullptr) {
 				dv_window_apply_pointer(next);
 				dv_window_apply_cursor_color(next);
@@ -2519,8 +3124,31 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 		s->switch_filter[0] = '\0';
 		redraw(s);
 		break;
-	case 'b':	/* broadcast: typing goes to every window */
+	case 'b':	/* broadcast: typing goes to the selected windows, or every one */
 		s->broadcast = !s->broadcast;
+		redraw(s);
+		break;
+	case 'x':	/* this window into the selection, or out of it */
+		if (w != nullptr)
+			w->selected = !w->selected;
+		redraw(s);
+		break;
+	case 'a': {	/* every window that shows selected; again, none */
+		struct dv_window	*it;
+		int			 all = 1, any = 0;
+
+		TAILQ_FOREACH(it, &d->windows, entry)
+			if (!it->hidden && !it->aside) {
+				any = 1;
+				all &= it->selected != 0;
+			}
+		TAILQ_FOREACH(it, &d->windows, entry)
+			it->selected = any && !all && !it->hidden && !it->aside;
+		redraw(s);
+		break;
+	}
+	case 'l':	/* lay the selected windows out together */
+		s->input_mode = DV_IN_TILE;
 		redraw(s);
 		break;
 	case 'i':
@@ -2542,19 +3170,23 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 			if (p != nullptr && p->display && q != p)
 				continue;
 			dv_conn_send(&q->conn, DV_MSG_EXIT, NULL, 0);
+			dv_agent_detach(q);
 			q->display = 0;
 			q->session = NULL;
 			any = 1;
 		}
-		if (any)
+		if (any) {
 			refresh_gfx(s);
+			refresh_focus(s);
+			recalculate_size(s);
+		}
 		break;
 	}
 	case '?':	/* help: the keys, the mouse, the Ghostty setup */
 		s->help_open = 1;
 		redraw(s);
 		break;
-	case 'q':	/* quit goblin-view: ask first, then tear the server down */
+	case 'q':	/* quit odin-seat: ask first, then tear the server down */
 		s->quit_confirm = 1;
 		redraw(s);
 		break;
@@ -2570,6 +3202,64 @@ dv_menu_cmd(struct dv_session *s, const char *arg, int step, struct dv_peer *p)
 	default:
 		break;
 	}
+}
+
+static int
+manage_window(struct dv_peer *p, int argc, char **argv)
+{
+	const char *sname = nullptr;
+	unsigned id = 0;
+	int below = 0, force = 0, i = 1;
+	int splitting = strcmp(argv[0], "split-window") == 0;
+
+	for (; i < argc; i++) {
+		if (strcmp(argv[i], "--") == 0) {
+			i++;
+			break;
+		}
+		if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
+			sname = argv[++i];
+		else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+			char *end;
+			const char *number = argv[++i];
+			unsigned long value;
+
+			errno = 0;
+			value = strtoul(number, &end, 10);
+			if (number[0] < '0' || number[0] > '9' || *end != '\0' ||
+			    errno == ERANGE || value == 0 || value > UINT_MAX)
+				return (send_reply(p, 1, "invalid window id\n"));
+			id = (unsigned)value;
+		} else if (splitting && strcmp(argv[i], "-h") == 0)
+			below = 0;
+		else if (splitting && strcmp(argv[i], "-v") == 0)
+			below = 1;
+		else if (!splitting && strcmp(argv[i], "-f") == 0)
+			force = 1;
+		else if (argv[i][0] == '-')
+			return (send_reply(p, 1, "invalid or incomplete window option\n"));
+		else
+			break;
+	}
+	if (!splitting && i != argc)
+		return (send_reply(p, 1, "kill-window does not take a program\n"));
+	struct dv_session *s = sname != nullptr ? dv_session_find(sname) :
+	    (p->session != nullptr ? p->session : dv_session_default());
+	if (s == nullptr)
+		return (send_reply(p, 1, "no session\n"));
+	struct dv_window *w = id != 0 ? dv_window_find(s, id) : s->desktop.focused;
+	if (w == nullptr)
+		return (send_reply(p, 1, "no such window\n"));
+	if (splitting) {
+		if (dv_window_split(w, below, i < argc ? argv + i : nullptr, p->cwd) == nullptr)
+			return (send_reply(p, 1, "cannot split: window too small or program could not start\n"));
+	} else {
+		if (force)
+			dv_pty_kill(w);
+		dv_window_close(w);
+	}
+	redraw(s);
+	return (send_reply(p, 0, ""));
 }
 
 static int
@@ -2614,6 +3304,14 @@ handle_command(struct dv_peer *p, unsigned char *payload, size_t len)
 		return (rc);
 	}
 
+    if (strcmp(argv[0], "agent-socket") == 0) {
+        sname = session_name_from_args(argc, argv, NULL);
+        s = sname ? dv_session_find(sname) : p->session ? p->session : dv_session_default();
+        if (!s) { free(argv); return send_reply(p, 1, "no session\n"); }
+        std::string answer = std::string(dv_agent_path(s)) + '\n';
+        free(argv);
+        return send_reply(p, 0, answer.c_str());
+    }
 	if (strcmp(argv[0], "list-clients") == 0) {
 		struct dv_buf	 b;
 		struct dv_peer	*q;
@@ -2644,16 +3342,17 @@ handle_command(struct dv_peer *p, unsigned char *payload, size_t len)
 	}
 
 	if (strcmp(argv[0], "upgrade") == 0) {
-		char		 exe[DV_PATH_MAX], state[DV_PATH_MAX], msg[DV_PATH_MAX + 80];
+		char		 state[DV_PATH_MAX], msg[DV_PATH_MAX + 80];
+		char		*exe = nullptr;
 		const char	*path = argc > 1 ? argv[1] : nullptr, *tmpdir = getenv("TMPDIR");
 		struct dv_peer	*q;
-		char		*const av[] = { const_cast<char *>("goblin-view"),
+		char		*const av[] = { const_cast<char *>("odin-seat"),
 		    const_cast<char *>("-S"), dv_srv->sock_path,
 		    const_cast<char *>(dv_srv->debug ? "-D" : "-v"),
 		    const_cast<char *>("takeover"), state, NULL };
 
 		if (path == nullptr) {
-			if (!dv_exe_path(exe, sizeof exe)) {
+			if ((exe = dv_exe_path()) == nullptr) {
 				free(argv);
 				return (send_reply(p, 1, "cannot tell my own path; give one\n"));
 			}
@@ -2661,11 +3360,13 @@ handle_command(struct dv_peer *p, unsigned char *payload, size_t len)
 		}
 		if (access(path, X_OK) != 0) {
 			snprintf(msg, sizeof msg, "%s: %s\n", path, strerror(errno));
+			free(exe);
 			free(argv);
 			return (send_reply(p, 1, msg));
 		}
-		snprintf(state, sizeof state, "%s/goblin-view-%ld.state",
+		snprintf(state, sizeof state, "%s/odin-seat-%ld.state",
 		    tmpdir != NULL && tmpdir[0] == '/' ? tmpdir : "/tmp", (long)getpid());
+		TAILQ_FOREACH(s, &dv_srv->sessions, entry) dv_agent_quiesce(s);
 		/* What is queued for a client goes out first, so nothing is
 		 * mid-message when the new program takes the sockets over. */
 		TAILQ_FOREACH(q, &dv_srv->peers, entry) {
@@ -2682,6 +3383,7 @@ handle_command(struct dv_peer *p, unsigned char *payload, size_t len)
 		if (!dv_state_write(state, p)) {
 			snprintf(msg, sizeof msg, "cannot write the state to %s: %s\n", state,
 			    strerror(errno));
+			free(exe);
 			free(argv);
 			return (send_reply(p, 1, msg));
 		}
@@ -2692,6 +3394,7 @@ handle_command(struct dv_peer *p, unsigned char *payload, size_t len)
 		dv_state_inherit_fds(0);
 		unlink(state);
 		snprintf(msg, sizeof msg, "exec %s: %s\n", path, strerror(errno));
+		free(exe);
 		free(argv);
 		return (send_reply(p, 1, msg));
 	}
@@ -2726,6 +3429,11 @@ handle_command(struct dv_peer *p, unsigned char *payload, size_t len)
 	if (strcmp(argv[0], "send-keys") == 0 || strcmp(argv[0], "capture-window") == 0 ||
 	    strcmp(argv[0], "pipe-window") == 0) {
 		rc = window_command(p, argc, argv);
+		free(argv);
+		return (rc);
+	}
+	if (strcmp(argv[0], "split-window") == 0 || strcmp(argv[0], "kill-window") == 0) {
+		rc = manage_window(p, argc, argv);
 		free(argv);
 		return (rc);
 	}
@@ -2923,9 +3631,9 @@ send_hello(struct dv_peer *p)
 {
 	unsigned char	hello[2 + sizeof DV_VERSION];
 	unsigned	proto = DV_PROTOCOL;
-	const char	*tp = getenv("GOBLIN_VIEW_TEST_PROTO");
+	const char	*tp = getenv("ODIN_SEAT_TEST_PROTO");
 
-	if (getenv("GOBLIN_VIEW_TEST_NOHELLO") != NULL)
+	if (getenv("ODIN_SEAT_TEST_NOHELLO") != NULL)
 		return;
 	if (tp != NULL && tp[0] != '\0')
 		proto = (unsigned)strtoul(tp, NULL, 10);
@@ -2991,17 +3699,31 @@ handle_identify(struct dv_peer *p, unsigned char *payload, size_t len)
 		}
 	}
 	if (q < end) p->pointer_caps = *q++ & 7;
-	p->silkie_blob[0] = '\0';
-	if (q + 2 <= end) {
-		unsigned	bl = get_u16(&q, end, &err);
+	dv_strset(&p->silkie_blob, nullptr);
+	if (q + 4 <= end) {
+		size_t	bl = ((size_t)q[0] << 24) | ((size_t)q[1] << 16) |
+		    ((size_t)q[2] << 8) | (size_t)q[3];
 
-		if (!err) {
-			if (q + bl > end)
-				bl = (unsigned)(end - q);
-			if (bl >= sizeof p->silkie_blob)
-				bl = (unsigned)sizeof p->silkie_blob - 1;
-			memcpy(p->silkie_blob, q, bl);
-			p->silkie_blob[bl] = '\0';
+		q += 4;
+		if (bl > (size_t)(end - q))
+			bl = (size_t)(end - q);
+		std::string	blob((const char *)q, bl);
+
+		dv_strset(&p->silkie_blob, blob.c_str());
+		q += bl;
+	}
+	/* --3d-focus, as decimal text; an older client sends none. */
+	p->focus_px = 0.0f;
+	if (q + 2 <= end) {
+		unsigned	fl = get_u16(&q, end, &err);
+
+		if (!err && fl <= (size_t)(end - q)) {
+			std::string	txt((const char *)q, fl);
+			float		px;
+
+			if (dv_parse_px(txt.c_str(), &px))
+				p->focus_px = px;
+			q += fl;
 		}
 	}
 	if (p->session != nullptr)
@@ -3026,6 +3748,9 @@ handle_resize(struct dv_peer *p, unsigned char *payload, size_t len)
 	p->tty.ypixel = get_u16(&q, end, &err);
 	if (err)
 		return;
+	/* A resize is also how a client says its display may have changed
+	 * (another screen, another mode): ask what it is now. */
+	dv_silkie_requery_display(p);
 	if (p->session != NULL && p->display)
 		recalculate_size(p->session);
 }
@@ -3175,6 +3900,12 @@ handle_stdin_msg(struct dv_peer *p, unsigned char *payload, size_t len)
 	if (p->session == NULL || !p->display)
 		return;
 	s = p->session;
+    if (len == 3 && payload[0] == 0x1b && payload[1] == '[' &&
+        (payload[2] == 'I' || payload[2] == 'O')) {
+        p->host_unfocused = payload[2] == 'O';
+        refresh_focus(s);
+        return;
+    }
 	w = s->desktop.focused;
 	if (len == 0)
 		return;
@@ -3234,9 +3965,10 @@ handle_stdin_msg(struct dv_peer *p, unsigned char *payload, size_t len)
 		return;
 	}
 
-	if (s->menu_open || s->uni_open || s->quit_confirm || s->im_choose ||
+	if (s->menu_open || s->uni_open || s->quit_confirm || s->kill_confirm || s->input_mode == DV_IN_SPLIT || s->im_choose ||
 	    s->help_open || s->xfer_prompt || s->switch_open ||
-	    s->input_mode == DV_IN_REARRANGE || s->input_mode == DV_IN_POSITION) {
+	    s->input_mode == DV_IN_REARRANGE || s->input_mode == DV_IN_POSITION ||
+	    s->input_mode == DV_IN_TILE) {
 		if (len == 1 && (payload[0] == 0x7f || payload[0] == 0x08)) {
 			dv_menu_cmd(s, "backspace", 1, p);
 			return;
@@ -3336,29 +4068,32 @@ handle_stdin_msg(struct dv_peer *p, unsigned char *payload, size_t len)
 			}
 			dv_window_pty_send(w, out.data, out.len);
 			dv_buf_free(&out);
+			dv_pstatus_key(w);
 			redraw(s);
 			return;
 		}
 	}
 
-	if (s->broadcast) {		/* every other window gets it too */
+	if (s->broadcast) {		/* the windows typing here reaches get it too */
 		struct dv_window	*it;
+		size_t			 nsel = selected_count(s);
 
 		TAILQ_FOREACH(it, &s->desktop.windows, entry)
-			if (it != w && it->pty_fd >= 0)
+			if (broadcast_reaches(s, w, it, nsel))
 				dv_window_pty_send(it, payload, len);
 	}
 	if (w->screen.app_cursor && len == 3 && payload[0] == 0x1b &&
 	    payload[1] == '[' && strchr("ABCDHF", payload[2]) != NULL)
 		payload[1] = 'O';
 	forward_input(s, w, payload, len);
+	dv_pstatus_key(w);		/* the user typed in it */
 }
 
 /* Is an overlay or a placing mode taking the keys? */
 static int
 modal_up(const struct dv_session *s)
 {
-	return (s->menu_open || s->uni_open || s->quit_confirm || s->im_choose ||
+	return (s->menu_open || s->uni_open || s->quit_confirm || s->kill_confirm || s->input_mode == DV_IN_SPLIT || s->im_choose ||
 	    s->help_open || s->xfer_prompt || s->title_edit || s->switch_open ||
 	    s->copy_open || s->input_mode != 0);
 }
@@ -3393,15 +4128,18 @@ handle_key_msg(struct dv_peer *p, unsigned char *payload, size_t len)
 		redraw(s);
 	}
 	n = dv_kbd_encode(&k, flags, buf, sizeof buf);
-	if (n > 0)
+	if (n > 0) {
 		dv_window_pty_send(w, buf, n);
+		dv_pstatus_key(w);		/* the user is back in it */
+	}
 	if (s->broadcast) {			/* the other windows, each in its own encoding */
 		struct dv_window	*it;
+		size_t			 nsel = selected_count(s);
 
 		TAILQ_FOREACH(it, &s->desktop.windows, entry) {
 			int	f;
 
-			if (it == w || it->pty_fd < 0)
+			if (!broadcast_reaches(s, w, it, nsel))
 				continue;
 			f = dv_screen_kbd_flags(&it->screen);
 			n = f ? dv_kbd_encode(&k, f, buf, sizeof buf) : k.nlegacy;
@@ -3426,17 +4164,54 @@ handle_msg(struct dv_peer *p, int type, unsigned char *payload, size_t len)
 	case DV_MSG_STDIN:
 		handle_stdin_msg(p, payload, len);
 		return (1);
+    case DV_MSG_AGENT_PART:
+    case DV_MSG_AGENT_END:
+        if (p->display) {
+            dv_buf_append(&p->agent_input,payload,len);
+            if (type==DV_MSG_AGENT_END) {
+                if (p->agent_input.len) dv_agent_reply(p,reinterpret_cast<const char *>(p->agent_input.data),p->agent_input.len);
+                dv_buf_free(&p->agent_input);
+            }
+        }
+        return 1;
 	case DV_MSG_OSC:
 		if (p->display)
 			handle_osc_reply(p, payload, len);
+		return (1);
+	case DV_MSG_APC:
+		if (p->display)
+			dv_kitty_host_reply(p, payload, len);
 		return (1);
 	case DV_MSG_MOUSE:
 		if (len >= 7 && p->display) {
 			unsigned	mx = ((unsigned)payload[0] << 8) | payload[1];
 			unsigned	my = ((unsigned)payload[2] << 8) | payload[3];
 			unsigned	mc = ((unsigned)payload[4] << 8) | payload[5];
+			int		have = 0, px = 0, py = 0;
 
-			handle_mouse(p, p->session, mx, my, mc, payload[6]);
+			/* Bytes 7..14 are the 0-based host pixel, when the client has one. */
+			if (len >= 15) {
+				unsigned	cw = p->tty.xpixel ? p->tty.xpixel :
+				    DV_DEFAULT_XPIXEL;
+				unsigned	ch = p->tty.ypixel ? p->tty.ypixel :
+				    DV_DEFAULT_YPIXEL;
+
+				px = (int)(((unsigned)payload[7] << 24) |
+				    ((unsigned)payload[8] << 16) |
+				    ((unsigned)payload[9] << 8) | payload[10]);
+				py = (int)(((unsigned)payload[11] << 24) |
+				    ((unsigned)payload[12] << 16) |
+				    ((unsigned)payload[13] << 8) | payload[14]);
+				if (px < 0)
+					px = 0;
+				if (py < 0)
+					py = 0;
+				mx = (unsigned)(px / (int)cw) + 1;
+				my = (unsigned)(py / (int)ch) + 1;
+				have = 1;
+			}
+			handle_mouse(p, p->session, mx, my, mc, payload[6],
+			    have, px, py);
 		} else if (len >= 6 && p->display) {	/* an older client */
 			unsigned	mx = ((unsigned)payload[0] << 8) | payload[1];
 			unsigned	my = ((unsigned)payload[2] << 8) | payload[3];
@@ -3458,15 +4233,38 @@ handle_msg(struct dv_peer *p, int type, unsigned char *payload, size_t len)
 	}
 }
 
+/* While accept() cannot get a descriptor, the backlog is left alone until
+ * then, rather than poll() returning at once for it again and again. */
+static long long	accept_paused_until;
+
+static void	accept_one(int);
+
+/* Every connection waiting, not one a pass: a burst is taken at once. */
 static void
-accept_peer(void)
+accept_peers(void)
+{
+	for (;;) {
+		int	fd = accept(dv_srv->listen_fd, NULL, NULL);
+
+		if (fd >= 0) {
+			accept_one(fd);
+			continue;
+		}
+		if (errno == EINTR || errno == ECONNABORTED)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			dv_log("accept: %s: pausing new connections", strerror(errno));
+			accept_paused_until = now_ms() + 250;
+		}
+		return;
+	}
+}
+
+static void
+accept_one(int fd)
 {
 	struct dv_peer	*p;
-	int		 fd;
 
-	fd = accept(dv_srv->listen_fd, NULL, NULL);
-	if (fd < 0)
-		return;
 	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
 	{
@@ -3476,6 +4274,7 @@ accept_peer(void)
 	}
 	p = dv_new<dv_peer>();
 	p->fd = fd;
+	p->pfd_slot = -1;		/* in the poll list from the next pass */
 	dv_conn_init(&p->conn, fd);
 	TAILQ_INSERT_TAIL(&dv_srv->peers, p, entry);
 }
@@ -3565,63 +4364,171 @@ srv_forward_osc(struct dv_window *w, const char *proto, unsigned osc,
 
 struct dv_config	dv_cfg;
 
+/* Changes keep being gathered while input arrives, at most this long. */
+#define DV_FRAME_MS	16
+
+/* What poll() said of an entry, by the index its owner kept. An owner made
+ * during the pass, or a descriptor number reused within it, has none. */
+static short
+slot_revents(const std::vector<struct pollfd> &pfds, int slot, int fd)
+{
+	if (slot < 0 || (size_t)slot >= pfds.size() || pfds[(size_t)slot].fd != fd)
+		return (0);
+	return (pfds[(size_t)slot].revents);
+}
+
+/*
+ * A frame some client can take now: its session changed, or it missed one
+ * while still writing. A client still writing is woken by POLLOUT instead,
+ * so it never keeps the loop from sleeping.
+ */
+static int
+frames_due(long long now, int *held)
+{
+	struct dv_peer	*p;
+
+	*held = 0;
+	TAILQ_FOREACH(p, &dv_srv->peers, entry)
+		if (p->display && p->session != nullptr && p->conn.out.len == 0 &&
+		    (p->session->dirty || p->behind)) {
+			int	hold = sync_hold(p->session, now);
+
+			if (hold == 0)
+				return (1);
+			/* Held for an update under way: look again when the
+			 * hold runs out, if the update has not ended first. */
+			if (*held == 0 || hold < *held)
+				*held = hold;
+		}
+	return (0);
+}
+
+/* One composition per session that some client needs drawn. */
+static void
+compose_due(void)
+{
+	struct dv_session	*s;
+	struct dv_peer		*p;
+
+	long long		 now = now_ms();
+
+	TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
+		if (sync_hold(s, now) != 0)
+			continue;
+		TAILQ_FOREACH(p, &dv_srv->peers, entry)
+			if (p->display && p->session == s && (s->dirty || p->behind)) {
+				compose_send(s);
+				break;
+			}
+	}
+}
+
 static int
 server_loop(void)
+try
 {
-	struct pollfd	 pfds[256];
+	std::vector<struct pollfd> pfds;
 	struct dv_peer	*p, *p1;
 	struct dv_session *s;
 	struct dv_window *w;
-	int		 nfd, i, nfds;
+	int		 nfd;
+	size_t		 nfds;
+	long long	 dirty_since = 0;	/* first change not yet drawn */
 
+	fcntl(dv_srv->listen_fd, F_SETFL,
+	    fcntl(dv_srv->listen_fd, F_GETFL) | O_NONBLOCK);
+	reap_children();		/* any that ended before we were here */
 	while (!dv_quit) {
-		nfds = 0;
-		pfds[nfds].fd = dv_srv->listen_fd;
-		pfds[nfds].events = POLLIN;
-		nfds++;
+		long long	now;
+		int		timeout, due, held;
+
+		dv_agent_tick();
+		now = now_ms();
+		/*
+		 * Draw when input runs dry, so a keystroke is shown at once, or
+		 * DV_FRAME_MS after the first change not yet drawn while input
+		 * keeps coming, so a flood is drawn a frame at a time instead of
+		 * once a read.
+		 */
+		due = frames_due(now, &held);
+		if (due && dirty_since == 0)
+			dirty_since = now;
+		if (due && now - dirty_since >= DV_FRAME_MS) {
+			compose_due();
+			dirty_since = 0;
+			due = 0;
+		}
+
+		/* Each entry's index is kept by its owner: no search for it. */
+		pfds.clear();
+		pfds.push_back({ now >= accept_paused_until ? dv_srv->listen_fd : -1,
+		    POLLIN, 0 });
+		pfds.push_back({ sig_pipe[0], POLLIN, 0 });
 		TAILQ_FOREACH(p, &dv_srv->peers, entry) {
-			if (nfds >= 255)
-				break;
-			pfds[nfds].fd = p->fd;
-			pfds[nfds].events = POLLIN;
-			if (p->conn.out.len)
-				pfds[nfds].events |= POLLOUT;
-			nfds++;
+			short events = POLLIN | (p->conn.out.len ? POLLOUT : 0);
+
+			p->pfd_slot = (int)pfds.size();
+			pfds.push_back({ p->fd, events, 0 });
 		}
 		TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
 			TAILQ_FOREACH(w, &s->desktop.windows, entry) {
-				if (w->pty_fd < 0 || nfds >= 255)
+				w->pfd_slot = -1;
+				if (w->pty_fd < 0)
 					continue;
-				pfds[nfds].fd = w->pty_fd;
-				pfds[nfds].events = POLLIN;
-				if (w->pty_out.len > 0)
-					pfds[nfds].events |= POLLOUT;
-				nfds++;
+				short events = POLLIN | (w->pty_out.len ? POLLOUT : 0);
+
+				w->pfd_slot = (int)pfds.size();
+				pfds.push_back({ w->pty_fd, events, 0 });
 			}
 		}
-		nfd = poll(pfds, (nfds_t)nfds, 500);
-		if (nfd < 0) {
-			if (errno == EINTR) {
-				reap_children();
-				continue;
+		dv_agent_poll(pfds);
+		nfds = pfds.size();
+		if ((nfds_t)nfds != nfds)
+			dv_fatal("poll descriptor count overflow");
+
+		/* With a frame to draw, only look; otherwise sleep until
+		 * something happens or something is due. */
+		if (due)
+			timeout = 0;
+		else {
+			timeout = dv_agent_wait_ms();
+			if (held > 0 && (timeout < 0 || held < timeout))
+				timeout = held;
+			if (now < accept_paused_until) {
+				long long	left = accept_paused_until - now;
+
+				if (timeout < 0 || left < timeout)
+					timeout = (int)left;
 			}
+		}
+		nfd = poll(pfds.data(), (nfds_t)nfds, timeout);
+		if (nfd < 0) {
+			if (errno == EINTR)
+				continue;
 			break;
 		}
-		reap_children();
+		if (nfd == 0) {
+			if (due) {		/* input ran dry: draw */
+				compose_due();
+				dirty_since = 0;
+			}
+			continue;
+		}
+		if (pfds[1].revents & POLLIN) {
+			char	drain[64];
+
+			while (read(sig_pipe[0], drain, sizeof drain) > 0)
+				continue;
+			reap_children();
+		}
 		if (pfds[0].revents & POLLIN)
-			accept_peer();
+			accept_peers();
 
 		TAILQ_FOREACH_SAFE(p, &dv_srv->peers, entry, p1) {
-			int	want_in = 0, want_out = 0, r;
+			short	rev = slot_revents(pfds, p->pfd_slot, p->fd);
+			int	want_in = (rev & (POLLIN | POLLHUP | POLLERR)) != 0;
+			int	want_out = (rev & POLLOUT) != 0, r;
 
-			for (i = 1; i < nfds; i++) {
-				if (pfds[i].fd != p->fd)
-					continue;
-				if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))
-					want_in = 1;
-				if (pfds[i].revents & POLLOUT)
-					want_out = 1;
-			}
 			if (want_out) {
 				if (dv_conn_flush(&p->conn) < 0) {
 					peer_close(p);
@@ -3664,36 +4571,22 @@ server_loop(void)
 			struct dv_window	*w1;
 
 			TAILQ_FOREACH_SAFE(w, &s->desktop.windows, entry, w1) {
-				int	want = 0, wout = 0;
+				short	rev;
 
 				if (w->pty_fd < 0)
 					continue;
-				for (i = 1; i < nfds; i++) {
-					if (pfds[i].fd != w->pty_fd)
-						continue;
-					if (pfds[i].revents &
-					    (POLLIN | POLLHUP | POLLERR))
-						want = 1;
-					if (pfds[i].revents & POLLOUT)
-						wout = 1;
-				}
-				if (wout) {
+				rev = slot_revents(pfds, w->pfd_slot, w->pty_fd);
+				if (rev & POLLOUT) {
 					/* the program took some: send more */
 					dv_window_pty_flush(w);
 					dv_xfer_pump(w);
 				}
-				if (want)
+				if (rev & (POLLIN | POLLHUP | POLLERR))
 					read_pty(w);
 			}
 		}
+		dv_agent_tick();
 		collect_dead_sessions();
-
-		TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
-			if (s->dirty) {
-				s->dirty = 0;
-				compose_send(s);
-			}
-		}
 	}
 
 	while ((p = TAILQ_FIRST(&dv_srv->peers)) != NULL)
@@ -3707,10 +4600,26 @@ server_loop(void)
 	dv_srv = NULL;
 	return (0);
 }
+catch (const std::bad_alloc &)
+{
+	dv_fatal("server storage allocation failed");
+}
+catch (const std::length_error &)
+{
+	dv_fatal("server storage size overflow");
+}
 
 static void
 server_signals(void)
 {
+	if (sig_pipe[0] < 0) {
+		if (pipe(sig_pipe) != 0)
+			dv_fatal("signal pipe: %s", strerror(errno));
+		for (int fd : sig_pipe) {
+			fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+			fcntl(fd, F_SETFD, FD_CLOEXEC);	/* not for children, nor an upgrade */
+		}
+	}
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, on_sigchld);
 	signal(SIGTERM, on_sigterm);
@@ -3728,17 +4637,17 @@ server_load_config(void)
 	dv_config_load(&dv_cfg, dv_config_path(), NULL, NULL);
 	dv_scrollback_lines = dv_cfg.scrollback;
 	dv_backdrop_glyph = dv_cfg.backdrop;
-	if (dv_cfg.kitty_medium[0] != '\0' && getenv("GOBLIN_VIEW_KITTY_MEDIUM") == NULL)
-		setenv("GOBLIN_VIEW_KITTY_MEDIUM", dv_cfg.kitty_medium, 1);
-	if (dv_cfg.download_dir[0] != '\0' && getenv("GOBLIN_VIEW_DOWNLOAD_DIR") == NULL)
-		setenv("GOBLIN_VIEW_DOWNLOAD_DIR", dv_cfg.download_dir, 1);
-	if (dv_cfg.term[0] != '\0' && getenv("GOBLIN_VIEW_TERM") == NULL)
-		setenv("GOBLIN_VIEW_TERM", dv_cfg.term, 1);
+	if (dv_cfg.kitty_medium[0] != '\0' && getenv("ODIN_SEAT_KITTY_MEDIUM") == NULL)
+		setenv("ODIN_SEAT_KITTY_MEDIUM", dv_cfg.kitty_medium, 1);
+	if (dv_cfg.download_dir[0] != '\0' && getenv("ODIN_SEAT_DOWNLOAD_DIR") == NULL)
+		setenv("ODIN_SEAT_DOWNLOAD_DIR", dv_cfg.download_dir, 1);
+	if (dv_cfg.term[0] != '\0' && getenv("ODIN_SEAT_TERM") == NULL)
+		setenv("ODIN_SEAT_TERM", dv_cfg.term, 1);
 	dv_limits_apply(&dv_cfg);
 }
 
 /*
- * This process was a goblin-view server that exec'd us: take over its
+ * This process was a odin-seat server that exec'd us: take over its
  * sessions, windows and clients from the state file on the descriptors
  * it left open, tell the client that asked, and carry on.
  */
@@ -3763,10 +4672,12 @@ dv_server_takeover(const char *statefile, const char *sock_path, int debug)
 		dv_fatal("takeover: cannot read %s", statefile);
 	unlink(statefile);
 	dv_log("takeover: %s, listening on fd %d", statefile, dv_srv->listen_fd);
-	snprintf(msg, sizeof msg, "upgraded: goblin-view %s (protocol %d)\n", DV_VERSION,
+	snprintf(msg, sizeof msg, "upgraded: odin-seat %s (protocol %d)\n", DV_VERSION,
 	    DV_PROTOCOL);
-	TAILQ_FOREACH(s, &dv_srv->sessions, entry)
+	TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
 		refresh_gfx(s);
+		refresh_focus(s);
+	}
 	TAILQ_FOREACH(p, &dv_srv->peers, entry)
 		if (p->display && p->session != nullptr)
 			dv_silkie_attach(p);

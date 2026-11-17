@@ -1,0 +1,630 @@
+.TH ODIN-SEAT-PROTOCOLS 7 2026-10-15 "Odin Seat 0.1.0" "Miscellaneous"
+.SH NAME
+odin-seat-protocols \- what a program running in a odin-seat window can use
+.SH DESCRIPTION
+Every
+.BR odin-seat (1)
+window is a terminal of its own, with the kitty protocol extensions
+implemented per window.
+Whatever is better done by the real terminal you attach from is handed
+to it, and its answer is routed back to the window that asked.
+A program never sees the multiplexer's own traffic and never talks to
+the host directly.
+This page lists what a program may rely on.
+Sequences are written with
+.B CSI
+for ESC [,
+.B OSC
+for ESC ],
+.B DCS
+for ESC P,
+.B APC
+for ESC _ and
+.B ST
+for ESC \e.
+.SH IDENTITY
+.TP
+.B TERM
+.BR xterm\-256color ,
+or
+.BR $ODIN_SEAT_TERM .
+.B COLORTERM
+is
+.BR truecolor .
+.TP
+XTVERSION
+.B CSI > q
+is answered
+.BR "DCS > | OdinSeat " version " ST" .
+.TP
+DA1
+.B CSI c
+reports a VT level with sixel when any attached terminal can show images.
+.TP
+XTGETTCAP
+.B DCS + q
+.I hexname
+[;
+.IR hexname ...]
+.B ST
+is answered one
+.B DCS 1 + r
+per known name and
+.B DCS 0 + r
+per unknown one.
+Known:
+.BR TN " (the TERM), " Tc ", " RGB ", " Su " (true), " colors " (256), " setrgbf ", " setrgbb ", " Smulx ", " Setulc ", " Ms .
+.TP
+XTSMGRAPHICS
+The graphics geometry reported is the size at which images will
+actually be shown: the host's pixels for a kitty host, the window's
+cell grid for a sixel host.
+.SH KEYBOARD
+Keys arrive as a legacy terminal would send them until the program
+pushes kitty keyboard flags.
+.B CSI > flags u
+pushes,
+.B CSI < n u
+pops
+.I n
+(default 1),
+.B CSI = flags ; mode u
+sets (mode 1 replaces, 2 ors in, 3 clears) and
+.B CSI ? u
+is answered
+.BR "CSI ? flags u" .
+The stack holds eight entries and evicts the oldest; a pop past the
+bottom resets every flag.
+The main and alternate screens have separate stacks.
+All five flags are honoured: disambiguated escapes, key release and
+repeat events, alternate keys, all keys as escapes (modifier keys
+included) and associated text.
+Enter, Tab and Backspace stay legacy unless all keys are escapes; the
+arrow, Home/End, F1\(enF12, Insert/Delete and Page keys keep their
+legacy CSI forms with modifiers and event types appended.
+.PP
+The host terminal is run with every enhancement on, so this works
+whenever the host speaks the protocol (Ghostty, kitty).
+On another terminal keys are legacy whatever the program asked.
+.SH MOUSE
+Modes 1000, 1002 and 1003 track clicks, drags and any motion; 1006
+reports SGR cell coordinates and 1016 SGR pixel coordinates. The pixel
+is the one the host reported, including its position inside the cell,
+translated into the window. A host that only reports cells yields the
+centre of the cell.
+Coordinates are the window's own.
+A window in pixel mode is sent kitty's leave event,
+.BR "CSI < 288 ; x ; y M" ,
+when the pointer moves off it or leaves the terminal.
+Mode 1007 (alternate scroll, on by default) turns the wheel into arrow
+keys on the alternate screen; a window with no tracking scrolls its own
+scrollback instead.
+Mode 2004 wraps pastes and drops in
+.B CSI 200 ~
+and
+.BR "CSI 201 ~" .
+Focus reporting (1004) follows the active visible window and host terminal
+focus. Switching windows or detaching sends focus-out; focus-in requires an
+attached focused host. Reports propagate through nested sessions.
+.SH TEXT
+Styled and coloured underlines:
+.BR "SGR 4:1" \(en "4:5" ,
+.B SGR 58
+(colour) and
+.BR "SGR 59" .
+.B SGR 221
+and
+.B 222
+reset bold and faint independently.
+DECCARA
+.RB ( "CSI Pt ; Pl ; Pb ; Pr ; attrs $ r" )
+changes attributes over a rectangle or a stream, DECSACE
+.RB ( "CSI Ps * x" )
+chooses which.
+.B CSI 22 J
+clears the screen into the scrollback and
+.B CSI n + T
+unscrolls
+.I n
+lines back out of it.
+.B CSI ? Pm s
+and
+.B CSI ? Pm r
+save and restore private modes (all side-effect-free ones when no
+parameter is given).
+OSC 66 text sizing lays a run into the grid at its scaled size and is
+re-emitted to a host that speaks it, with its fractional scale
+.RB ( n ", " d )
+and alignment
+.RB ( v ", " h ).
+A window keeps every run its screen and scrollback still show.
+.PP
+Synchronized output (mode 2026) makes what a program draws between
+.B CSI ? 2026 h
+and
+.B CSI ? 2026 l
+one frame: the window is not drawn while the update is under way, and is
+drawn the moment it ends.
+An update that is not ended holds the window for 150 ms at most.
+.B CSI ? Pm $ p
+(DECRQM) reports a private mode kept here as set (1) or reset (2), and
+any other as not recognised (0).
+A program may resize its window with
+.BR "CSI 8 ; rows ; cols t" ,
+capped to the desktop and shifted on-screen;
+.BR "CSI 14 t" ", " "CSI 16 t" " and " "CSI 18 t"
+report pixel, cell and grid sizes.
+.SH COLOURS
+OSC 4, 10, 11 and 12 set (and with
+.B ?
+query) palette entries and the default foreground, background and cursor
+colours; 104, 110, 111 and 112 reset them.
+OSC 21 is kitty's colour control with the same keys.
+OSC 30001 pushes the whole colour state and OSC 30101 pops it; the stack
+has no maximum depth.
+Silkie's deep colours,
+.BR "38:0:" id : r : g : b
+(and 48 and 58), give sixteen bits a channel; a cell keeps them exactly,
+and a terminal that lists
+.B deep
+in its
+.B sgr
+capability field is sent them after the eight-bit colour, in a sequence of
+their own, while any other is sent the nearest eight-bit colour.
+All of this is per window: the compositor remaps that window's cells, so
+two windows can redefine the palette differently and the host's own
+palette is never touched.
+The cursor colour is applied to the host for the focused window.
+.SH PROGRAM STATUS
+OSC 7501, the Program Status Protocol (revision 0.4), is kept per window:
+one record per id, each replaced whole by its next report, applying the
+protocol's lifetime rules (working, blocked and idle end at the next
+prompt; done and error stay until the window is focused or typed in; RIS
+removes all) and none of its size limits.
+The feature query
+.B "OSC 7501 ; ?"
+is answered here.
+A framed window shows its most urgent record after its title \(em the
+percentage or an ellipsis while working, a check mark when done, a cross on
+error, black on yellow when blocked on the user \(em with the number of
+records in that state when more than one, and what the record says along
+its bottom border.
+A terminal that answers the feature query when a client attaches is sent
+every window's records beneath an id of the window's own,
+.BR w N / id ,
+and as its root record the most urgent of them all, titled by its window;
+they are cleared there when a window closes and when the client detaches.
+OSC 9;4 progress is a window's root record until its program sends a
+report of its own.
+.SH CLIPBOARD AND NOTIFICATIONS
+OSC 52 (set and read) and kitty's OSC 5522 go to the terminal, wrapped
+for an outer tmux when nested; a read's answer comes back to the window
+that asked.
+Desktop notifications (OSC 99) go to the terminal. OSC 9 and OSC 777
+notify;title;body are converted to OSC 99 with focus and report actions.
+An OSC 9 that starts with a number from 1 to 12 and then
+.B ;
+or its end is a ConEmu sub-command:
+.B 2
+is a notification of its text,
+.B 3
+sets the window title (empty restores it),
+.B 4
+is progress, kept as the window's program status rather than notified,
+.B 9
+records the working directory (as OSC 7 does, which new split windows
+start in),
+.B 12
+marks a prompt like OSC 133;A, and the others are ignored.
+A click restores the originating window, including hidden or aside windows;
+converted notices consume the reply rather than sending unexpected input
+into the application.
+.PP
+Each hop appends
+.B odin-seat/session-token/window-id
+in OSC 99 metadata
+.BR r .
+Slash separates fields and comma separates hops, from the application outward.
+Silkie appends its own native-window hop on activation and returns the full
+route plus the effective requested actions in
+.BR a .
+Focus is restored from outside inward only when requested; report-only
+notifications do not steal focus. Rich OSC 99 callers receive their original
+ID, selected button, and complete route when they request report.
+.PP
+Notification IDs are wrapped in opaque self-routing addresses, one per layer,
+so routing does not evict pending notices or truncate IDs. The session token
+survives live server upgrades. Replies to closed windows or stale sessions
+are discarded rather than guessed onto the focused window. Older hosts can
+restore converted notices by their wrapped ID; full path and action reporting
+requires Silkie's notification routing extension.
+.PP
+Codex can use this path with these settings in ~/.codex/config.toml:
+.nf
+[tui]
+notifications = true
+notification_method = "osc9"
+notification_condition = "unfocused"
+.fi
+Start a new Codex session after changing its configuration.
+A read with nobody attached is answered empty at once.
+.SH POINTER SHAPES
+OSC 22 sets, pushes
+.RB ( > ),
+pops
+.RB ( < )
+and queries
+.RB ( ? )
+the pointer shape as a stack per window.
+The host shows the shape of the window under the pointer, or of the
+focused window over the backdrop.
+.SH EXTRA CURSORS
+kitty's multiple cursors protocol:
+.B CSI > shape ; type : coords ; ... SP q
+with shapes 0 (clear), 1 block, 2 beam, 3 underline and 29 (as the main
+cursor), coordinates as
+.I y:x
+points (type 2), top:left:bottom:right rectangles (type 4) or the main
+cursor's cell (type 0); 30 and 40 set the text and cursor colours; 100
+and 101 query positions and colours;
+.B CSI > SP q
+lists what is supported.
+Cursors clear on ED 2, 3 and 22, on RIS and on switching screens.
+A host that draws extra cursors is sent the visible set translated to
+the desktop; one that cannot shows them as reverse video or underline.
+.SH GRAPHICS
+Each window is a kitty graphics endpoint: it stores what the program
+transmits (any medium: direct, file, temporary file, shared memory;
+PNG or raw pixels; chunked), answers its queries, and keeps placements
+floating over the grid, including Unicode placeholders.
+Sixel (DCS q) is decoded into the same placements.
+What the terminal is shown depends on what it speaks: kitty graphics
+re-emitted under a host-global id, or the placement rasterised to sixel
+at the window's cell grid, or nothing.
+A placement moves with its window, is clipped by windows above it, scrolls
+with the text, and goes with ED 2, the alternate screen or a delete.
+.PP
+A window whose placements go under its text (a negative
+.BR z ),
+start part way into a cell
+.RB ( X ", " Y )
+or overlap one another is
+.IR layered :
+more than placeholder cells can say.
+A kitty graphics terminal whose cells are the size the programs were told
+is sent each of its images once and each placement as a real one, at its
+cell, offset, source rectangle and
+.BR z ,
+cut to the cells where the window shows: in several pieces under another
+window's frame or a menu, each with its part of the source, and none at
+all for a window wholly covered, hidden or set aside.
+A placement made again under its id moves without its pixels being sent
+again.
+A placement fitted to cells
+.RB ( c ", " r )
+is sent as the program made it while it shows whole; cut, its pieces are
+whole cells, each with its share of the source.
+With several terminals attached, programs draw for the largest cell among
+them.
+A kitty graphics terminal with another cell is sent each picture scaled to
+its own, and the placements with their offsets and source rectangles in its
+own pixels.
+A vector scene
+.RB ( f=200 )
+is sent as the same records at the scaled size, its root group
+.RB ( "g id=0" )
+carrying the program's transform followed by the scaling; an edit of the
+root group reaches such a terminal as the whole scene sent again.
+Only a GPU surface goes as it is, fitted to its cells for the terminal to
+scale.
+A terminal that shows sixel has no placements to layer: the window's
+pictures are blended into one canvas of its pixels, at their offsets and
+.BR z ,
+and the sixels are cut from that, a cell with text keeping its text.
+Only the rectangles whose pixels changed are sent again.
+Pixels in a wider gamut
+.RB ( G )
+are accepted when any attached terminal takes them, and sent as the
+nearest sRGB to one that does not; a colour in a wider gamut
+.RB ( "38:2:1" )
+likewise.
+The display programs are told of is the best of every terminal's: its
+colour model, gamut, headroom and channel widths (and the
+.B output_bits
+of the surface it draws into) are each the most any of them has.
+The capability reply lists
+.B sgr=alpha,deep,gamut,hdr
+whatever is attached: those attributes are kept in every cell and brought
+down for a terminal that lacks them.
+A vector scene
+.RB ( f=200 )
+or HDR pixels
+.RB ( f=64 )
+are accepted whatever is attached: a terminal that takes neither is sent
+the scene drawn as pixels, at the size it shows it and again when it is
+edited, and HDR as what eight bits show.
+A text record of a scene
+.RB ( t )
+is laid out here, shaped by HarfBuzz in the fonts of the machine the server
+runs on, a family it lacks falling back to the font of its role.
+With no terminal attached that draws scenes, the vector service
+.RB ( a=v )
+is answered here from the same layout:
+.BR fonts ", " inspect ", " upload ", " release " and " measure .
+A raster image inside a scene
+.RB ( i )
+is not drawn.
+A terminal with neither kitty graphics nor sixel is drawn every picture as
+coloured half-block cells, unless
+.B cell-pictures
+is off.
+Images are offered to programs when some attached terminal can show them
+in one of these ways; DA1 and the kitty query say so.
+.SH SILKIE
+Silkie's OSC 777 extensions
+.RB ( caps ", " depth ", " display ", " font ", " frame ", " gesture ", " haptic ", " ink ", " latency ", " scroll " and " tablet-pointer )
+are answered by
+.B odin-seat
+itself.
+A program is offered a selector only when this program can carry it and
+some attached terminal listed it.
+Frames have no length limit of their own.
+Reports are translated into the window the contact began on, including
+its frame and scroll, and a contact is cancelled when that window
+moves, resizes, closes or is reset.
+Modes belong to the window; the terminal is sent the union.
+Picture formats and transmission media are whatever every attached
+terminal shares, so a picture one of them cannot show is refused.
+The formats that are decoded here are the exception: they are always
+taken and always offered.
+They are kitty's indexed colour
+.RB ( f=8 ", " f=16 ),
+drawn in the window's own colours, Silkie's packed pixels
+.RB ( f=301 ", " f=302 ", " f=304 ", " f=308
+gray and
+.B f=516
+RGB565), its palette images
+.RB ( f=401 ", " f=402 ", " f=404 ", " f=408 ,
+whose palette
+.B a=e
+replaces), and its high precision pixels
+.RB ( f=316 ", " f=632 ", " f=664 )
+with the transfer function key
+.BR E .
+The numbers Silkie used before 2026-11-16
+.RB ( f=1 ", " f=2 ", " f=4 )
+are refused.
+Images have no size or storage limit but the arithmetic and memory;
+.B S
+and
+.B O
+are 64-bit.
+A feature query
+.RB ( a=q
+with
+.BR e= )
+is answered with the keys taken for that action.
+.PP
+Each kitty graphics terminal is sent each picture packed for its own
+display, as its display reply describes it: on a gray or black and white
+display (or one painted with
+.BR \-m )
+as gray at the levels it shows, on a display with fewer than eight bits a
+channel (RGB565, say) at those widths.
+Nothing the display cannot show is sent.
+Then the narrowest format that holds what is left exactly, among those the
+terminal listed: one, two, four or eight bits of gray, RGB565, a palette
+image of its colours, RGB without
+alpha when every pixel is opaque, RGBA otherwise; deflated
+.RB ( o=z )
+when that is smaller.
+The program's own form is sent instead when nothing was reduced and it is
+no bigger.
+Indexed colour goes as it is to a terminal that lists it, in that
+terminal's colours, unless its window set colours of its own; it is sent
+again when they change.
+Pixels of more than eight bits, or with another curve, go as they are to a
+terminal that lists them, as half floats
+.RB ( f=64 )
+to one that takes HDR pixels, and as eight bits of sRGB to the rest.
+Each form is worked out once per picture and display.
+A terminal is asked about its display when it attaches and again whenever
+its client reports a resize, and a display event from it counts the same;
+when the answer changes, its pictures are sent again.
+Its channel widths
+.RB ( red_bits ", " green_bits ", " blue_bits ", " gray_bits ", " precision )
+reach programs that ask.
+OSC 133
+.B A
+and a caps reset clear that window's modes; OSC 133
+.B A
+also returns its stereo depth to the terminal plane.
+The earlier
+.B goblin-pointer
+and
+.B goblin-download
+uses of OSC 777 are unchanged.
+.PP
+.B font
+selection, and its SGR 10 to 19 aliases, is a text attribute.
+Role, weight and slant stay with each cell through scrollback, resizing
+and a live upgrade, and are painted to the terminals that listed
+.BR font.1 ;
+another terminal attached beside them sees ordinary text.
+The query answers with the roles of every attached terminal and the
+ranges all of them accept.
+.PP
+.B depth
+is Silkie's stereo depth: a text attribute giving binocular disparity in
+millidegrees
+.RB ( d= )
+or reference pixels
+.RB ( p= ),
+and vertical phase
+.RB ( y= ).
+An update is validated as a whole; an omitted attribute keeps its value.
+Both stay with each cell through scrollback, resizing, the saved cursor
+and a live upgrade, and are reset by SGR 0,
+.BR op=reset ,
+RIS and OSC 133
+.BR A .
+They are painted to the terminals that listed
+.BR depth.1 ;
+another terminal sees the text flat.
+A kitty image placement takes the depth in effect when it is made, and is
+made at that depth at the terminal; a vector image's
+.BR depth= ,
+.B depth_px=
+and
+.B phase=
+keys travel inside its records.
+Painting order and text layout are unchanged.
+.PP
+A vector image
+.RB ( f=200 )
+is kept as its table of records, with what is inside the records (shaped
+text, box clips, HDR and wide gamut paints) carried unread, apart from the
+fonts and images they name.
+An edit
+.RB ( a=e )
+goes to the terminals that hold the scene, without sending it again; one
+that attaches later is sent the scene as it stands.
+The vector service
+.RB ( a=v )
+is answered by the first attached terminal that takes vector images and
+routed back to the window that asked.
+Session fonts belong to the window that uploaded them, under names of
+this program's choosing at the terminal, and the name a program gave is
+what it reads back.
+A released font is kept until no scene uses it, since a terminal attaching
+later has to shape those scenes itself; layouts that name it fail at once.
+Strokes a terminal draws for itself with
+.B ink
+are worked out from its reports and added to the table, so other terminals
+see them as they are drawn and a terminal sent the scene again has them.
+A stroke goes when it is cancelled, and moving or resizing a window cancels
+the strokes in it.
+A terminal inks an image only through the cells it was sent, so ink stays
+inside the window and under any window above it; a stroke that leaves the
+window goes on, and what falls outside is not shown.
+Each terminal holds the one brush its pen is about to need: for the placement
+under the pen if that window has a brush, and otherwise for the focused
+window's placement of its brush's image, the
+.B U=1
+one or else the direct one on top.
+A pen that comes down on another without hovering first is not inked, and the
+program draws that stroke itself.
+A terminal is given ids of Odin Seat's for its strokes, each standing for one
+window's brush on one placement, so programs may choose the same ids and any
+number of terminals may ink at once.
+The program's own id goes in the report, the next of those it set aside, and
+when the stroke ends the terminal's element becomes the table's record under
+that id; if that could not leave the same drawing order, as when the program
+drew during the stroke, that terminal is sent the scene again.
+A program that turns ink off during a stroke stops the terminal drawing it, and
+a change of focus does not cut a stroke short.
+While a stroke is inked its reports give the program the terminal's numbers by
+the protocol's formulas, even where a whole number of cells or another shape
+of cell shows the placement somewhat differently from what the program asked
+for, so a position in such a report can differ from the pen's by part of a
+cell.
+Ink a window's program would not hear of, as for a contact held back as
+accidental, is deleted at once.
+Images, scenes and session fonts do not survive
+.BR upgrade .
+.PP
+An OSC 22 image shape names an image of the window, which goes to the
+terminal under an id of ours.
+While the window has no such image the shape below it on the stack shows.
+The
+.B kitty-query-hdr_headroom
+XTGETTCAP query is answered with the headroom the display last reported.
+.SH FILE TRANSFER
+kitty's file transfer protocol (OSC 5113) works in both directions, and
+goblin-mosh's background download (OSC 777
+.BR goblin-download )
+towards the user.
+When the terminal you attach from speaks the protocol \(en kitty for
+5113, goblin-mosh for 777, known by their XTVERSION names \(en the
+request is handed to it and its replies routed back.
+Otherwise
+.B odin-seat
+is the endpoint: a box asks whether to save the files into the downloads
+directory
+.RB ( $ODIN_SEAT_DOWNLOAD_DIR ", " $XDG_DOWNLOAD_DIR ", or " ~/Downloads )
+or, for a receive, whether the program may read the files it named.
+Files are staged, inflated when sent compressed, size-checked,
+published without overwriting and never opened or run.
+A pasted
+.B y
+cannot approve.
+.PP
+Statuses follow the protocols:
+.BR OK ", " STARTED ", " PROGRESS ", " CANCELED
+and
+.BI E CODE :message
+for 5113; for 777 a query is answered
+.B status=supported
+with
+.BR max_chunk=4096 ", " max_size=67108864 " and " approval=1 ,
+a confirmed begin gets
+.B approved
+once permitted, a complete stream
+.B queued
+then
+.B saved
+with the final name, and refusal or failure
+.B error
+with a message.
+rsync deltas are declined with
+.BR EINVAL .
+.SH DRAG AND DROP
+kitty's drag and drop protocol (OSC 72).
+The terminal is told what is accepted; each drag is routed to the window
+under it and translated to that window's cells and pixels.
+A program that announced
+.B t=a
+gets the motion, drop, data and completion messages and its answers are
+relayed.
+Otherwise the drop is taken on the window's behalf: files as their
+paths, quoted for a shell when needed, or plain text, pasted into that
+window, bracketed if the program asked for bracketed paste.
+A terminal that delivers drops as a bracketed paste still has the paste
+routed to the focused window.
+.SH SEE ALSO
+.BR odin-seat (1)
+.PP
+The kitty terminal protocol extensions:
+.I https://sw.kovidgoyal.net/kitty/protocol-extensions/
+
+.SH SSH AGENT TRANSPORT
+OSC 777 selector ssh-agent, version 1, carries complete SSH agent packets in
+base64, including their four-byte big-endian length. query/cap discovers the
+provider's availability and generation; request/reply carries a packet with
+request id, connection token, generation, and an absolute Unix-millisecond
+expiry. close retires a connection without a reply. The caps listing includes
+ssh-agent.1 independently of provider availability.
+.PP
+New windows receive a stable per-session SSH_AUTH_SOCK. Agent requests go only
+to the most recently attached display client, independently of pane focus.
+On disconnect, the previous attached display is selected. A provider change
+fails pending requests and existing connections; reopening the same socket
+gets the new client's keys. IDs and connections are scoped across nested
+windows and replies are never injected as keyboard input. Socket path,
+listener, selection order and routing scope survive live server upgrades;
+connections can be reopened after upgrade.
+.PP
+The global -A option authorizes the client's local SSH_AUTH_SOCK as a fallback
+when the terminal has no provider, including agents forwarded by ordinary SSH.
+Enable ssh_agent_forwarding yes in Silkie. Silkie uses the local SSH_AUTH_SOCK
+or starts an owned ssh-agent and exports its socket to new local shells.
+Requests may list keys, sign, or use session-bind@openssh.com and query
+extensions. Backend connections persist so OpenSSH bindings are retained;
+key mutation, smartcard loading and locking are refused. Agent access grants
+terminal-output writers signing privileges, like ordinary agent forwarding.
+.PP
+Private keys remain at the provider. No key lists or signatures are cached.
+Stale, closed, duplicate and expired requests fail without retrying a signing
+action. Socket directories are mode 0700 and sockets mode 0600. Storage grows
+with input and active connections. See docs/SSH_AGENT_PROTOCOL.md and
+https://silkie.goblinreactor.com/ssh-agent-protocol.html for the wire format.

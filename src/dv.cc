@@ -5,41 +5,51 @@
 #include "dv.hpp"
 
 #include <errno.h>
+#include <getopt.h>
 #include <string.h>
 #include <unistd.h>
 
 int	dv_debug;
 int	dv_mono;
+float	dv_focus_px;
 
 static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: goblin-view [-Dmv] [-L name] [-S path] [command [args]]\n"
+	    "Odin Seat — a desktop in your terminal\n"
+	    "usage: odin-seat [-ADmv] [--3d-focus=X] [-L name] [-S path] [command [args]]\n"
+	    "  -A  allow the local SSH_AUTH_SOCK when the terminal has no agent\n"
 	    "  -m  paint this terminal in strict black and white (e-paper);\n"
-	    "      also GOBLIN_VIEW_MONO=1 in the environment\n"
+	    "      also ODIN_SEAT_MONO=1 in the environment\n"
+	    "  --3d-focus=X  on a terminal that shows Silkie depth, the focused\n"
+	    "      window and all it shows X pixels nearer (negative: farther)\n"
 	    "commands:\n"
 	    "  (none)          attach, creating a session if needed\n"
 	    "  new-session     [-d] [-x cols] [-y rows] [-s name] [cmd...]\n"
 	    "  new-window      [-s name] [cmd...]   (open a window in a session)\n"
+	    "  split-window    [-h|-v] [-s name] [-w N] [-- cmd...]\n"
+	    "                  -h opens to the right (default); -v opens below\n"
+	    "  kill-window     [-f] [-s name] [-w N]  (-f kills hung programs)\n"
 	    "  attach          [-s name]\n"
 	    "  list-windows    [-s name]\n"
 	    "  list-sessions\n"
 	    "  kill-session    [name]\n"
 	    "  kill-server\n"
 	    "  list-clients\n"
+	    "  agent-socket    [-s name]   (stable SSH_AUTH_SOCK for this session)\n"
 	    "  send-keys       [-s name] [-w N] [-l] text...   (C escapes unless -l)\n"
 	    "  capture-window  [-s name] [-w N] [-S lines|-]   (the window's text)\n"
 	    "  pipe-window     [-s name] [-w N] [path]         (log output; no path stops)\n"
 	    "  save            [-f file]   (every session's windows, cwd and command)\n"
-	    "  restore         [-f file]   (recreate them; default ~/.local/state/goblin-view/sessions)\n"
+	    "  restore         [-f file]   (recreate them; default ~/.local/state/odin-seat/sessions)\n"
 	    "  upgrade         [binary]    (the server becomes this program, in place;\n"
 	    "                               windows and attached terminals carry on)\n"
-	    "  menu            <key>      (O/C/R/Z/Q/1-9, M/P/H, arrows)\n"
-	    "config file keys (0 means no limit; see goblin-view(1)):\n"
-	    "  csi-limit       max bytes of one CSI (ESC [); also GOBLIN_VIEW_CSI_LIMIT\n"
-	    "  escape-limit    max bytes of one OSC, APC or DCS; also GOBLIN_VIEW_ESCAPE_LIMIT\n"
-	    "see goblin-view(1) and goblin-view-protocols(7)\n");
+	    "  menu            <key>      (O/C/E/K/R/Z/Q/1-9, M/P/H, arrows)\n"
+	    "config file keys (0 means no limit; see odin-seat(1)):\n"
+	    "  csi-limit       max bytes of one CSI (ESC [); also ODIN_SEAT_CSI_LIMIT\n"
+	    "  escape-limit    max bytes of one OSC, APC or DCS; also ODIN_SEAT_ESCAPE_LIMIT\n"
+	    "see odin-seat(1) and odin-seat-protocols(7)\n");
 	exit(1);
 }
 
@@ -48,11 +58,14 @@ is_command(const char *s)
 {
 	return (strcmp(s, "new-session") == 0 ||
 	    strcmp(s, "new-window") == 0 ||
+	    strcmp(s, "split-window") == 0 ||
+	    strcmp(s, "kill-window") == 0 ||
 	    strcmp(s, "attach") == 0 ||
 	    strcmp(s, "refresh") == 0 ||
 	    strcmp(s, "mouse") == 0 ||
 	    strcmp(s, "list-windows") == 0 ||
 	    strcmp(s, "list-clients") == 0 ||
+	    strcmp(s, "agent-socket") == 0 ||
 	    strcmp(s, "list-sessions") == 0 ||
 	    strcmp(s, "kill-session") == 0 ||
 	    strcmp(s, "kill-server") == 0 ||
@@ -69,7 +82,7 @@ is_command(const char *s)
 static void
 config_warn(const char *path, int line, const char *msg)
 {
-	fprintf(stderr, "goblin-view: %s:%d: %s\n", path, line, msg);
+	fprintf(stderr, "odin-seat: %s:%d: %s\n", path, line, msg);
 }
 
 static int
@@ -97,10 +110,13 @@ main(int argc, char **argv)
 	int		 opt;
 	const char	*label = "default";
 	const char	*path_override = nullptr;
-	const char	*dv_sock = getenv("GOBLIN_VIEW_SOCK");
+	const char	*dv_sock = getenv("ODIN_SEAT_SOCK");
 	int		 have_label = 0;
+    bool local_agent = false;
 	char		*sock;
 	char		**cmdv;
+	std::vector<char *>	scoped_command;
+	char		*upgrade_path = nullptr;
 	char		 attach_lit[] = "attach";
 	char		*attach_cmd[] = { attach_lit, nullptr };
 	int		 display;
@@ -112,13 +128,27 @@ main(int argc, char **argv)
 	 * from new-session.
 	 */
 	{
-		const char	*m = getenv("GOBLIN_VIEW_MONO");
+		const char	*m = getenv("ODIN_SEAT_MONO");
 
 		if (m != NULL && m[0] != '\0' && strcmp(m, "0") != 0)
 			dv_mono = 1;
 	}
-	while ((opt = getopt(argc, argv, "+DL:S:mvhV")) != -1) {
+	static const struct option longopts[] = {
+		{ "3d-focus", required_argument, nullptr, 'F' },
+		{ nullptr, 0, nullptr, 0 }
+	};
+
+	while ((opt = getopt_long(argc, argv, "+ADL:S:mvhV", longopts,
+	    nullptr)) != -1) {
 		switch (opt) {
+		case 'F':
+			if (!dv_parse_px(optarg, &dv_focus_px)) {
+				fprintf(stderr, "odin-seat: --3d-focus: not a number "
+				    "of pixels: %s\n", optarg);
+				return (1);
+			}
+			break;
+		case 'A': local_agent = true; break;
 		case 'D':
 			dv_debug = 1;
 			dv_verbose = 1;
@@ -138,7 +168,7 @@ main(int argc, char **argv)
 			dv_verbose = 1;
 			break;
 		case 'V':
-			printf("goblin-view %s\n", DV_VERSION);
+			printf("Odin Seat %s\n", DV_VERSION);
 			printf("data directory: %s\n", dv_im_datadir());
 			return (0);
 		case 'h':
@@ -169,12 +199,12 @@ main(int argc, char **argv)
 	memset(&sz, 0, sizeof sz);
 	display = command_is_display(argc == 0 ? 1 : argc, cmdv);
 	if (display && !isatty(STDIN_FILENO)) {
-		fprintf(stderr, "goblin-view: attach needs a tty\n");
+		fprintf(stderr, "odin-seat: attach needs a tty\n");
 		return (1);
 	}
 	if (display) {
 		if (dv_tty_size(&sz) < 0) {
-			fprintf(stderr, "goblin-view: tty size: %s\n", strerror(errno));
+			fprintf(stderr, "odin-seat: tty size: %s\n", strerror(errno));
 			return (1);
 		}
 	}
@@ -183,23 +213,49 @@ main(int argc, char **argv)
 		term = "";
 
 	/*
-	 * Inside a goblin-view window ($GOBLIN_VIEW_SOCK set): talk to THIS server, and never
+	 * Inside a odin-seat window ($ODIN_SEAT_SOCK set): talk to THIS server, and never
 	 * nest a display -- a recursive attach is a terminal in a terminal.
 	 * Window-manager commands still work; they act on this desktop.
 	 */
 	if (dv_sock != NULL && dv_sock[0] != '\0') {
 		if (display) {
 			fprintf(stderr,
-			    "goblin-view: already inside a goblin-view session.\n"
+			    "odin-seat: already inside a odin-seat session.\n"
 			    "    Tap Alt (or Ctrl-\\) for the menu, or run "
 			    "a command, e.g.:\n"
-			    "      goblin-view new-window            open another window\n"
-			    "      goblin-view list-windows          list this desktop\n"
-			    "      goblin-view menu o                open  (also c/z/1-9)\n");
+			    "      odin-seat new-window            open another window\n"
+			    "      odin-seat list-windows          list this desktop\n"
+			    "      odin-seat menu o                open  (also c/z/1-9)\n");
 			return (1);
 		}
 		if (!have_label && path_override == nullptr)
 			path_override = dv_sock;
+		const char *session = getenv("ODIN_SEAT_SESSION");
+		if (!have_label && path_override != nullptr &&
+		    strcmp(path_override, dv_sock) == 0 && session != nullptr &&
+		    session[0] != '\0' && (strcmp(cmdv[0], "split-window") == 0 ||
+		    strcmp(cmdv[0], "kill-window") == 0 || strcmp(cmdv[0], "agent-socket") == 0)) {
+			int explicit_session = 0;
+
+			for (int i = 1; cmdv[i] != nullptr; i++) {
+				if (strcmp(cmdv[i], "--") == 0 || cmdv[i][0] != '-')
+					break;
+				if (strcmp(cmdv[i], "-s") == 0) {
+					explicit_session = 1;
+					break;
+				}
+				if (strcmp(cmdv[i], "-w") == 0 && cmdv[i + 1] != nullptr)
+					i++;
+			}
+			if (!explicit_session) {
+				scoped_command = {cmdv[0], const_cast<char *>("-s"),
+				    const_cast<char *>(session)};
+				for (int i = 1; cmdv[i] != nullptr; i++)
+					scoped_command.push_back(cmdv[i]);
+				scoped_command.push_back(nullptr);
+				cmdv = scoped_command.data();
+			}
+		}
 	}
 
 	sock = dv_socket_path(label, path_override);
@@ -210,17 +266,17 @@ main(int argc, char **argv)
 	}
 	if (strcmp(cmdv[0], "upgrade") == 0 && argc == 1) {
 		/* to this program, by default */
-		static char	exe[DV_PATH_MAX], real[DV_PATH_MAX];
 		static char	*upgrade_cmd[3];
 
-		if (dv_exe_path(exe, sizeof exe) && realpath(exe, real) != NULL) {
+		if ((upgrade_path = dv_exe_path()) != nullptr) {
 			upgrade_cmd[0] = cmdv[0];
-			upgrade_cmd[1] = real;
+			upgrade_cmd[1] = upgrade_path;
 			upgrade_cmd[2] = NULL;
 			cmdv = upgrade_cmd;
 		}
 	}
-	opt = dv_client_run(sock, display, sz, term, cmdv);
+	opt = dv_client_run(sock, display, sz, term, cmdv, local_agent);
+	free(upgrade_path);
 	free(sock);
 	return (opt);
 }

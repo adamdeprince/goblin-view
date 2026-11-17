@@ -39,7 +39,7 @@ main(void)
 		return (1);
 	}
 	f = fdopen(fd, "w");
-	fputs("# goblin-view config\n"
+	fputs("# odin-seat config\n"
 	    "shell = /bin/zsh   # trailing comment\n"
 	    "scrollback = 5000\n"
 	    "backdrop = \"·\"\n"
@@ -85,11 +85,11 @@ main(void)
 		fail("menu-key = ctrl-backslash");
 	if (c.csi_limit != 1024 || c.escape_limit != 0)
 		fail("csi-limit and escape-limit");
-	setenv("GOBLIN_VIEW_CSI_LIMIT", "8", 1);
+	setenv("ODIN_SEAT_CSI_LIMIT", "8", 1);
 	dv_limits_apply(&c);
 	if (dv_csi_limit != 8 || dv_escape_limit != 0)
-		fail("GOBLIN_VIEW_CSI_LIMIT overrides the file");
-	unsetenv("GOBLIN_VIEW_CSI_LIMIT");
+		fail("ODIN_SEAT_CSI_LIMIT overrides the file");
+	unsetenv("ODIN_SEAT_CSI_LIMIT");
 	dv_limits_apply(&c);
 	if (dv_csi_limit != 1024)
 		fail("csi-limit returns when the environment is unset");
@@ -119,7 +119,7 @@ main(void)
 	if (c.scrollback != 1000 || strcmp(c.shell, "/bin/sh") != 0 ||
 	    c.menu_key != (DV_MENU_KEY_ALT | DV_MENU_KEY_CTRL_BACKSLASH))
 		fail("good lines after bad ones still apply");
-	if (dv_config_load(&c, "/nonexistent/goblin-view/config", NULL, warn) != -1)
+	if (dv_config_load(&c, "/nonexistent/odin-seat/config", NULL, warn) != -1)
 		fail("a missing file is -1, not an error");
 	unlink(path);
 	if (failed)

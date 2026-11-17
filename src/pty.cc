@@ -3,6 +3,7 @@
  */
 
 #include "dv.hpp"
+#include "agent.hpp"
 
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -58,14 +59,16 @@ dv_pty_spawn(struct dv_window *w, const char *cmd, char *const *cmd_argv)
 	char *const	*av;
 
 	fill_winsize(&ws, w->lcols, w->lrows, d->xpixel, d->ypixel);
+	const std::string agent_socket = dv_agent_path(w->session);
 	pid = forkpty(&fd, NULL, NULL, &ws);
 	if (pid < 0) {
 		dv_log("forkpty: %s", strerror(errno));
 		return (-1);
 	}
 	if (pid == 0) {
+		setenv("SSH_AUTH_SOCK", agent_socket.c_str(), 1);
 		{
-			const char	*term = getenv("GOBLIN_VIEW_TERM");
+			const char	*term = getenv("ODIN_SEAT_TERM");
 
 			/*
 			 * xterm-256color until the inner emulator answers
@@ -79,14 +82,14 @@ dv_pty_spawn(struct dv_window *w, const char *cmd, char *const *cmd_argv)
 			setenv("COLORTERM", "truecolor", 1);
 		}
 		/*
-		 * Tell programs (and a nested goblin-view) they are inside a session,
-		 * and which one, so `goblin-view` here manages this desktop instead of
+		 * Tell programs (and a nested odin-seat) they are inside a session,
+		 * and which one, so `odin-seat` here manages this desktop instead of
 		 * starting another. Mirrors tmux's $TMUX.
 		 */
 		if (dv_srv != NULL && dv_srv->sock_path != NULL)
-			setenv("GOBLIN_VIEW_SOCK", dv_srv->sock_path, 1);
+			setenv("ODIN_SEAT_SOCK", dv_srv->sock_path, 1);
 		if (w->session != NULL)
-			setenv("GOBLIN_VIEW_SESSION", w->session->name, 1);
+			setenv("ODIN_SEAT_SESSION", w->session->name, 1);
 		/*
 		 * The server daemonised into "/", so without this every
 		 * window would start there. Prefer the client's cwd, then
@@ -121,6 +124,23 @@ dv_pty_spawn(struct dv_window *w, const char *cmd, char *const *cmd_argv)
 	w->pty_fd = fd;
 	w->pid = pid;
 	return (0);
+}
+
+void
+dv_pty_kill(struct dv_window *w)
+{
+	/* Job-control shells put the foreground job in a different group.
+	 * Capture that group while the PTY is still open, before hanging up. */
+	pid_t foreground = w->pty_fd >= 0 ? tcgetpgrp(w->pty_fd) : -1;
+	pid_t own_group = getpgrp();
+
+	if (foreground > 1 && foreground != own_group)
+		kill(-foreground, SIGKILL);
+	if (w->pid > 1 && w->pid != getpid()) {
+		if (w->pid != own_group)
+			kill(-w->pid, SIGKILL);
+		kill(w->pid, SIGKILL);
+	}
 }
 
 void

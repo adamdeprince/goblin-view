@@ -7,7 +7,11 @@
  */
 
 #include "dv.hpp"
+
+int (*dv_agent_app_hook)(struct dv_window *, const char *, size_t) = nullptr;
+#include "notification_route.hpp"
 #include "silkie.hpp"
+#include "pstatus.hpp"
 
 #include <climits>
 #include <errno.h>
@@ -39,6 +43,9 @@ cell_blank(struct dv_cell *c, uint32_t fg, uint32_t bg)
 	c->alpha = 100;
 	c->fg_br = c->bg_br = 100;
 	c->fg_gamut = c->bg_gamut = 0;
+	c->fg_x = c->bg_x = c->u_x = 0;
+	c->font = 0;
+	c->depth = 0;
 }
 
 static struct dv_cell *
@@ -116,13 +123,15 @@ dv_screen_free(struct dv_screen *s)
 		free(s->sb[(s->sb_head + i) % s->sb_cap]);
 	free(s->sb);
 	free(s->sb_w);
-	for (i = 0; i < DV_STEXTS; i++)
-		free(s->stext[i].text);
+	delete s->stexts;
 	free(s->cells);
 	free(s->alt);
 	free(s->params);
 	free(s->sub);
+	free(s->silk_brush);
+	free(s->silk_shown);
 	delete s->kpl;
+	delete s->palstack;
 	memset(s, 0, sizeof *s);
 }
 
@@ -196,6 +205,9 @@ dv_screen_disp_at(struct dv_screen *s, unsigned x, unsigned y)
 	blank.alpha = 100;
 	blank.fg_br = blank.bg_br = 100;
 	blank.fg_gamut = blank.bg_gamut = 0;
+	blank.fg_x = blank.bg_x = blank.u_x = 0;
+	blank.font = 0;
+	blank.depth = 0;
 	first = s->sb_len - s->sb_off;		/* virtual index of the top row */
 	vi = first + y;
 	if (vi < s->sb_len) {			/* a scrollback line */
@@ -281,6 +293,20 @@ places_clear(struct dv_screen *s, int all)
 		});
 }
 
+/* A row going into the scrollback takes the scaled-text runs its cells
+ * name with it: the sweep has to look there from now on. */
+static void
+sb_note_stext(struct dv_screen *s, const struct dv_cell *row, unsigned width)
+{
+	if (s->sb_stext || s->stexts == nullptr)
+		return;
+	for (unsigned x = 0; x < width; x++)
+		if (row[x].ch == DV_STEXT_MARK) {
+			s->sb_stext = 1;
+			return;
+		}
+}
+
 /* Push one screen row into the scrollback ring, evicting the oldest when
  * full. The row is copied at the current width. */
 static void
@@ -300,6 +326,7 @@ sb_push(struct dv_screen *s, const struct dv_cell *row)
 	memcpy(s->sb[idx], row, (size_t)s->cols * sizeof(struct dv_cell));
 	s->sb_w[idx] = s->cols;
 	s->sb_len++;
+	sb_note_stext(s, row, s->cols);
 }
 
 /* A scrollback line from outside (a handed-over state): width cells,
@@ -321,6 +348,7 @@ dv_screen_sb_push(struct dv_screen *s, const struct dv_cell *row, unsigned width
 	memcpy(s->sb[idx], row, (size_t)width * sizeof(struct dv_cell));
 	s->sb_w[idx] = width;
 	s->sb_len++;
+	sb_note_stext(s, row, width);
 }
 
 /*
@@ -335,14 +363,17 @@ cell_same(const struct dv_cell *a, const struct dv_cell *b)
 	    a->ustyle == b->ustyle && a->ucolor == b->ucolor && a->irow == b->irow &&
 	    a->icol == b->icol && a->alpha == b->alpha && a->fg_br == b->fg_br &&
 	    a->bg_br == b->bg_br && a->fg_gamut == b->fg_gamut &&
-	    a->bg_gamut == b->bg_gamut);
+	    a->bg_gamut == b->bg_gamut && a->font == b->font &&
+	    a->depth == b->depth && a->fg_x == b->fg_x && a->bg_x == b->bg_x &&
+	    a->u_x == b->u_x);
 }
 
 void
 dv_cells_encode(struct dv_buf *b, const struct dv_cell *cells, unsigned n)
 {
 	unsigned	i = 0;
-	char		t[160];
+	/* 18 hex u32s (144), 17 commas, a space, '*' and a decimal u32 (10): 173. */
+	char		t[176];
 
 	while (i < n) {
 		unsigned	run = 1;
@@ -350,11 +381,16 @@ dv_cells_encode(struct dv_buf *b, const struct dv_cell *cells, unsigned n)
 
 		while (i + run < n && cell_same(&cells[i], &cells[i + run]))
 			run++;
-		l = snprintf(t, sizeof t, "%s%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x",
+		l = snprintf(t, sizeof t, "%s%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x,%x",
 		    i ? " " : "",
 		    cells[i].ch, cells[i].fg, cells[i].bg, cells[i].attr, cells[i].ustyle,
 		    cells[i].ucolor, cells[i].irow, cells[i].icol, cells[i].alpha,
-		    cells[i].fg_br, cells[i].bg_br, cells[i].fg_gamut, cells[i].bg_gamut);
+		    cells[i].fg_br, cells[i].bg_br, cells[i].fg_gamut, cells[i].bg_gamut,
+		    cells[i].font, cells[i].depth);
+		/* Deep colours as three more fields, only where there are any. */
+		if (cells[i].fg_x != 0 || cells[i].bg_x != 0 || cells[i].u_x != 0)
+			l += snprintf(t + l, sizeof t - (size_t)l, ",%x,%x,%x",
+			    cells[i].fg_x, cells[i].bg_x, cells[i].u_x);
 		if (run > 1)
 			l += snprintf(t + l, sizeof t - (size_t)l, "*%u", run);
 		dv_buf_append(b, t, (size_t)l);
@@ -369,7 +405,7 @@ dv_cells_decode(const char *text, struct dv_cell *cells, unsigned n)
 	const char	*p = text;
 
 	while (i < n && *p != '\0') {
-		unsigned	v[13], run = 1, k;
+		unsigned	v[18], run = 1, k;
 		char		*end;
 
 		while (*p == ' ')
@@ -378,7 +414,8 @@ dv_cells_decode(const char *text, struct dv_cell *cells, unsigned n)
 			break;
 		v[8] = 100;
 		v[9] = v[10] = 100;
-		v[11] = v[12] = 0;
+		v[11] = v[12] = v[13] = v[14] = 0;
+		v[15] = v[16] = v[17] = 0;
 		for (k = 0; k < 8; k++) {
 			v[k] = (unsigned)strtoul(p, &end, 16);
 			if (end == p)
@@ -390,7 +427,7 @@ dv_cells_decode(const char *text, struct dv_cell *cells, unsigned n)
 				p++;
 			}
 		}
-		for (k = 8; k < 13 && *p == ','; k++) {
+		for (k = 8; k < 18 && *p == ','; k++) {
 			p++;
 			v[k] = (unsigned)strtoul(p, &end, 16);
 			if (end == p)
@@ -415,6 +452,11 @@ dv_cells_decode(const char *text, struct dv_cell *cells, unsigned n)
 			cells[i].bg_br = (uint16_t)v[10];
 			cells[i].fg_gamut = (uint8_t)v[11];
 			cells[i].bg_gamut = (uint8_t)v[12];
+			cells[i].font = v[13];
+			cells[i].depth = v[14];
+			cells[i].fg_x = v[15];
+			cells[i].bg_x = v[16];
+			cells[i].u_x = v[17];
 		}
 	}
 	return (i);
@@ -765,6 +807,11 @@ put_ch(struct dv_screen *s, uint32_t cp)
 	c->bg_br = s->bg_br;
 	c->fg_gamut = s->fg_gamut;
 	c->bg_gamut = s->bg_gamut;
+	c->fg_x = s->fg_x;
+	c->bg_x = s->bg_x;
+	c->u_x = s->u_x;
+	c->font = s->font;
+	c->depth = s->depth;
 	c->irow = c->icol = 0;
 	if (cp == DV_KITTY_PLACEHOLDER)
 		placeholder_begin(s, c);
@@ -786,6 +833,11 @@ put_ch(struct dv_screen *s, uint32_t cp)
 			c->bg_br = s->bg_br;
 			c->fg_gamut = s->fg_gamut;
 			c->bg_gamut = s->bg_gamut;
+			c->fg_x = s->fg_x;
+			c->bg_x = s->bg_x;
+			c->u_x = s->u_x;
+			c->font = s->font;
+			c->depth = s->depth;
 		}
 	}
 	s->cc += (unsigned)width;
@@ -822,6 +874,11 @@ save_cursor(struct dv_screen *s, struct dv_cursor_save *sv)
 	sv->bg_br = s->bg_br;
 	sv->fg_gamut = s->fg_gamut;
 	sv->bg_gamut = s->bg_gamut;
+	sv->fg_x = s->fg_x;
+	sv->bg_x = s->bg_x;
+	sv->u_x = s->u_x;
+	sv->font = s->font;
+	sv->depth = s->depth;
 	sv->valid = 1;
 }
 
@@ -843,6 +900,11 @@ restore_cursor(struct dv_screen *s, const struct dv_cursor_save *sv)
 	s->bg_br = sv->bg_br;
 	s->fg_gamut = sv->fg_gamut;
 	s->bg_gamut = sv->bg_gamut;
+	s->fg_x = sv->fg_x;
+	s->bg_x = sv->bg_x;
+	s->u_x = sv->u_x;
+	s->font = sv->font;
+	s->depth = sv->depth;
 }
 
 static void
@@ -877,15 +939,9 @@ reset(struct dv_screen *s)
 {
 	swap_alt(s, 0);
 	places_clear(s, 1);
-	{
-		unsigned	i;
-
-		for (i = 0; i < DV_STEXTS; i++) {
-			free(s->stext[i].text);
-			s->stext[i].text = nullptr;
-			s->stext[i].used = 0;
-		}
-	}
+	delete s->stexts;
+	s->stexts = nullptr;
+	s->stext_sweep = 0;
 	fill_blank(s->cells, s->cols * s->rows, DV_COLOR_DEFAULT,
 	    DV_COLOR_DEFAULT);
 	s->cr = s->cc = 0;
@@ -894,6 +950,8 @@ reset(struct dv_screen *s)
 	s->wrap = 1;
 	s->alt_scroll = 1;
 	s->bracketed = 0;
+	s->sync = 0;
+	s->focus_report = 0;
 	s->pointer_mode = 0;
 	s->visible = 1;
 	s->app_cursor = 0;
@@ -908,12 +966,15 @@ reset(struct dv_screen *s)
 	s->alpha = 100;
 	s->fg_br = s->bg_br = 100;
 	s->fg_gamut = s->bg_gamut = 0;
+	s->fg_x = s->bg_x = s->u_x = 0;
+	s->font = 0;
+	s->depth = 0;
 	s->silk_tablet = s->silk_scroll = s->silk_gesture = 0;
 	s->silk_frame = s->silk_latency = s->silk_display = s->silk_ink = 0;
 	s->silk_frame_seq = 0;
 	s->silk_frame_dirty = 0;
-	s->silk_brush[0] = '\0';
-	s->silk_shown[0] = '\0';
+	dv_strset(&s->silk_brush, nullptr);
+	dv_strset(&s->silk_shown, nullptr);
 	s->sace = 0;
 	s->nsmode = 0;
 	memset(&s->saved, 0, sizeof s->saved);
@@ -952,6 +1013,17 @@ dv_window_pty_send(struct dv_window *w, const void *data, size_t n)
 		return;
 	dv_buf_append(&w->pty_out, data, n);
 	dv_window_pty_flush(w);
+}
+
+void
+dv_window_report_focus(struct dv_window *w, bool force)
+{
+    if (!w || !w->screen.focus_report) return;
+    const bool focused = w->session && w->session->desktop.focused == w &&
+        !w->session->host_unfocused && !w->hidden && !w->aside;
+    if (force || w->focus_state != focused)
+        dv_window_pty_send(w, focused ? "\033[I" : "\033[O", 3);
+    w->focus_state = focused;
 }
 
 static void
@@ -1112,19 +1184,31 @@ sgr_alpha(const struct dv_screen *s, int i)
 	return ((uint8_t)(v & ~1));
 }
 
+/*
+ * 38/48/58 and what follows. A colour that is set sets its gamut (when
+ * gamut is given) and its deep word: 0, or for Silkie's 38:0:id:r:g:b,
+ * sixteen bits a channel, the nearest eight-bit colour in *out and the
+ * rest in *deep (dv_deep_make). A 38:0 group with an empty field, fewer
+ * than four values after the 0 or a component above 65535 is malformed
+ * and changes nothing. Returns the parameters consumed after i.
+ */
 static int
-sgr_extended(struct dv_screen *s, int i, uint32_t *out, uint8_t *gamut)
+sgr_extended(struct dv_screen *s, int i, uint32_t *out, uint8_t *gamut,
+    uint32_t *deep)
 {
 	int	k = subcount(s, i);
 
-	if (gamut != nullptr)
-		*gamut = 0;
 	if (k > 0) {
 		if (s->params[i + 1] == 5 && k >= 2) {
 			*out = color_256(s->params[i + 2]);
+			if (gamut != nullptr)
+				*gamut = 0;
+			*deep = 0;
 			return (k);
 		}
 		if (s->params[i + 1] == 2 && k >= 4) {
+			if (gamut != nullptr)
+				*gamut = 0;
 			if (k >= 5) {
 				*out = color_rgb(s->params[i + 3],
 				    s->params[i + 4], s->params[i + 5]);
@@ -1133,17 +1217,44 @@ sgr_extended(struct dv_screen *s, int i, uint32_t *out, uint8_t *gamut)
 			} else
 				*out = color_rgb(s->params[i + 2],
 				    s->params[i + 3], s->params[i + 4]);
+			*deep = 0;
+			return (k);
+		}
+		if (s->params[i + 1] == 0 && k >= 5) {
+			int		id = s->params[i + 2];
+			unsigned	c[3];
+
+			/* An empty field is a missing one: too few values. */
+			if (id < 0 || (s->sub[i + 2] & 2))
+				return (k);
+			for (int j = 0; j < 3; j++) {
+				int	v = s->params[i + 3 + j];
+
+				if (v < 0 || v > 65535 || (s->sub[i + 3 + j] & 2))
+					return (k);
+				c[j] = (unsigned)v;
+			}
+			id = gamut_id(id);
+			*deep = dv_deep_make(c[0], c[1], c[2], (unsigned)id, out);
+			if (gamut != nullptr)
+				*gamut = (uint8_t)id;
 			return (k);
 		}
 		return (k);
 	}
 	if (i + 2 < s->np && s->params[i + 1] == 5) {
 		*out = color_256(s->params[i + 2]);
+		if (gamut != nullptr)
+			*gamut = 0;
+		*deep = 0;
 		return (2);
 	}
 	if (i + 4 < s->np && s->params[i + 1] == 2) {
 		*out = color_rgb(s->params[i + 2], s->params[i + 3],
 		    s->params[i + 4]);
+		if (gamut != nullptr)
+			*gamut = 0;
+		*deep = 0;
 		return (4);
 	}
 	return (s->np - i - 1);
@@ -1157,6 +1268,9 @@ struct sgr_st {
 	uint8_t		alpha;
 	uint16_t	fg_br, bg_br;
 	uint8_t		fg_gamut, bg_gamut;
+	uint32_t	fg_x, bg_x, u_x;
+	uint32_t	font;
+	uint32_t	depth;
 };
 
 static void
@@ -1176,7 +1290,8 @@ sgr_underline(struct sgr_st *t, int style)
  * bold and faint independently.
  */
 static void
-sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
+sgr_apply(struct dv_screen *s, int from, struct sgr_st *t,
+    const struct dv_session *sn)
 {
 	int	i;
 
@@ -1194,6 +1309,9 @@ sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
 			t->alpha = 100;
 			t->fg_br = t->bg_br = 100;
 			t->fg_gamut = t->bg_gamut = 0;
+			t->fg_x = t->bg_x = t->u_x = 0;
+			t->font = 0;
+			t->depth = 0;
 			break;
 		case 1:
 			t->attr |= DV_ATTR_BOLD;
@@ -1222,6 +1340,10 @@ sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
 		case 9:
 			t->attr |= DV_ATTR_STRIKE;
 			break;
+		case 10: case 11: case 12: case 13: case 14:
+		case 15: case 16: case 17: case 18: case 19:
+			t->font = dv_font_slot(sn, t->font, v);
+			break;
 		case 21:
 			sgr_underline(t, 2);	/* double underline */
 			break;
@@ -1244,18 +1366,20 @@ sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
 			t->attr &= (uint8_t)~DV_ATTR_STRIKE;
 			break;
 		case 38:
-			i += sgr_extended(s, i, &t->fg, &t->fg_gamut);
+			i += sgr_extended(s, i, &t->fg, &t->fg_gamut, &t->fg_x);
 			break;
 		case 39:
 			t->fg = DV_COLOR_DEFAULT;
 			t->fg_gamut = 0;
+			t->fg_x = 0;
 			break;
 		case 48:
-			i += sgr_extended(s, i, &t->bg, &t->bg_gamut);
+			i += sgr_extended(s, i, &t->bg, &t->bg_gamut, &t->bg_x);
 			break;
 		case 49:
 			t->bg = DV_COLOR_DEFAULT;
 			t->bg_gamut = 0;
+			t->bg_x = 0;
 			break;
 		case 56:
 			t->fg_br = sgr_brightness(s, i);
@@ -1264,10 +1388,11 @@ sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
 			t->bg_br = sgr_brightness(s, i);
 			break;
 		case 58:
-			i += sgr_extended(s, i, &t->ucolor, nullptr);
+			i += sgr_extended(s, i, &t->ucolor, nullptr, &t->u_x);
 			break;
 		case 59:
 			t->ucolor = DV_COLOR_DEFAULT;
+			t->u_x = 0;
 			break;
 		case 70:
 			t->alpha = sgr_alpha(s, i);
@@ -1282,15 +1407,19 @@ sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
 			if (v >= 30 && v <= 37) {
 				t->fg = (uint32_t)(v - 30);
 				t->fg_gamut = 0;
+				t->fg_x = 0;
 			} else if (v >= 40 && v <= 47) {
 				t->bg = (uint32_t)(v - 40);
 				t->bg_gamut = 0;
+				t->bg_x = 0;
 			} else if (v >= 90 && v <= 97) {
 				t->fg = (uint32_t)(v - 90 + 8);
 				t->fg_gamut = 0;
+				t->fg_x = 0;
 			} else if (v >= 100 && v <= 107) {
 				t->bg = (uint32_t)(v - 100 + 8);
 				t->bg_gamut = 0;
+				t->bg_x = 0;
 			}
 			break;
 		}
@@ -1298,7 +1427,7 @@ sgr_apply(struct dv_screen *s, int from, struct sgr_st *t)
 }
 
 static void
-sgr(struct dv_screen *s)
+sgr(struct dv_screen *s, const struct dv_session *sn)
 {
 	struct sgr_st	t;
 
@@ -1310,6 +1439,9 @@ sgr(struct dv_screen *s)
 		s->alpha = 100;
 		s->fg_br = s->bg_br = 100;
 		s->fg_gamut = s->bg_gamut = 0;
+		s->fg_x = s->bg_x = s->u_x = 0;
+		s->font = 0;
+		s->depth = 0;
 		return;
 	}
 	t.fg = s->fg;
@@ -1322,7 +1454,12 @@ sgr(struct dv_screen *s)
 	t.bg_br = s->bg_br;
 	t.fg_gamut = s->fg_gamut;
 	t.bg_gamut = s->bg_gamut;
-	sgr_apply(s, 0, &t);
+	t.fg_x = s->fg_x;
+	t.bg_x = s->bg_x;
+	t.u_x = s->u_x;
+	t.font = s->font;
+	t.depth = s->depth;
+	sgr_apply(s, 0, &t, sn);
 	s->fg = t.fg;
 	s->bg = t.bg;
 	s->ucolor = t.ucolor;
@@ -1333,6 +1470,11 @@ sgr(struct dv_screen *s)
 	s->bg_br = t.bg_br;
 	s->fg_gamut = t.fg_gamut;
 	s->bg_gamut = t.bg_gamut;
+	s->fg_x = t.fg_x;
+	s->bg_x = t.bg_x;
+	s->u_x = t.u_x;
+	s->font = t.font;
+	s->depth = t.depth;
 }
 
 /*
@@ -1342,7 +1484,7 @@ sgr(struct dv_screen *s)
  * colours included. No attributes means reset.
  */
 static void
-deccara(struct dv_screen *s)
+deccara(struct dv_screen *s, const struct dv_session *sn)
 {
 	int		pt = param(s, 0, 1), pl = param(s, 1, 1);
 	int		pb = param(s, 2, (int)s->rows), pr = param(s, 3, (int)s->cols);
@@ -1390,6 +1532,11 @@ deccara(struct dv_screen *s)
 			t.bg_br = c->bg_br;
 			t.fg_gamut = c->fg_gamut;
 			t.bg_gamut = c->bg_gamut;
+			t.fg_x = c->fg_x;
+			t.bg_x = c->bg_x;
+			t.u_x = c->u_x;
+			t.font = c->font;
+			t.depth = c->depth;
 			if (s->np <= 4) {
 				t.fg = t.bg = DV_COLOR_DEFAULT;
 				t.ucolor = DV_COLOR_DEFAULT;
@@ -1398,8 +1545,11 @@ deccara(struct dv_screen *s)
 				t.alpha = 100;
 				t.fg_br = t.bg_br = 100;
 				t.fg_gamut = t.bg_gamut = 0;
+				t.fg_x = t.bg_x = t.u_x = 0;
+				t.font = 0;
+				t.depth = 0;
 			} else
-				sgr_apply(s, 4, &t);
+				sgr_apply(s, 4, &t, sn);
 			c->fg = t.fg;
 			c->bg = t.bg;
 			c->ucolor = t.ucolor;
@@ -1410,6 +1560,11 @@ deccara(struct dv_screen *s)
 			c->bg_br = t.bg_br;
 			c->fg_gamut = t.fg_gamut;
 			c->bg_gamut = t.bg_gamut;
+			c->fg_x = t.fg_x;
+			c->bg_x = t.bg_x;
+			c->u_x = t.u_x;
+			c->font = t.font;
+			c->depth = t.depth;
 		}
 	}
 }
@@ -1542,12 +1697,18 @@ set_mode(struct dv_screen *s, int priv, int mode, int on)
 			s->mouse = 0;
 		break;
 	case 1004:
-		break;	/* focus reporting: goblin-view owns the host focus */
+		s->focus_report = on;
+		break;
 	case 1007:	/* alternate scroll: wheel becomes arrows (default on) */
 		s->alt_scroll = on;
 		break;
 	case 2004:	/* bracketed paste: the app wants ESC[200~/201~ wrappers */
 		s->bracketed = on;
+		break;
+	case 2026:	/* synchronized output: what is drawn until it ends is one frame */
+		if (!on && s->sync)
+			s->sync_done = 1;
+		s->sync = on;
 		break;
 	case 1005:
 	case 1006:
@@ -1616,7 +1777,9 @@ mode_get(const struct dv_screen *s, int mode)
 	case 1006: return (s->mouse_sgr == 1);
 	case 1016: return (s->mouse_sgr == 2);
 	case 1007: return (s->alt_scroll);
+	case 1004: return (s->focus_report);
 	case 2004: return (s->bracketed);
+	case 2026: return (s->sync);
 	case 80: return (s->sixel_dm);
 	case 8452: return (s->sixel_right);
 	default: return (-1);
@@ -1675,6 +1838,7 @@ xtrestore(struct dv_screen *s)
 static void
 do_csi(struct dv_window *w, int final)
 {
+    const bool was_reporting_focus = w->screen.focus_report;
 	struct dv_screen	*s = &w->screen;
 	char			 rep[64];
 	int			 a, b, i;
@@ -1788,7 +1952,7 @@ do_csi(struct dv_window *w, int final)
 		break;
 	case 'm':
 		if (s->prefix == 0)
-			sgr(s);
+			sgr(s, w->session);
 		break;
 	case 'r':
 		if (s->prefix == '?') {		/* XTRESTORE private modes */
@@ -1796,7 +1960,7 @@ do_csi(struct dv_window *w, int final)
 			break;
 		}
 		if (s->inter == '$') {		/* DECCARA */
-			deccara(s);
+			deccara(s, w->session);
 			break;
 		}
 		a = param(s, 0, 1);
@@ -1865,16 +2029,23 @@ do_csi(struct dv_window *w, int final)
 		if (s->prefix == '>' && s->inter == ' ')	/* extra cursors */
 			xcur_csi(w);
 		else if (s->prefix == '>')	/* XTVERSION: name ourselves */
-			vt_reply(w, "\033P>|GoblinView " DV_VERSION "\033\\");
+			vt_reply(w, "\033P>|OdinSeat " DV_VERSION "\033\\");
 		break;
 	case 'p':
 		/*
-		 * DECRQM: report a private mode as "not recognised" (0), so a
-		 * program that probes support (sync 2026, bracketed paste, ...)
+		 * DECRQM: a private mode kept here is reported set (1) or
+		 * reset (2), which is how a program learns it may use it
+		 * (synchronized output 2026, pixel mouse reports 1016, ...).
+		 * Any other is "not recognised" (0), so a program that probes
 		 * gets an answer and does not block waiting for one.
 		 */
-		if (s->prefix == '?') {
-			snprintf(rep, sizeof rep, "\033[?%d;0$y", param(s, 0, 0));
+		if (s->prefix == '?' && s->inter == '$') {
+			int	mode = param(s, 0, 0);
+			int	v = mode == 1049 || mode == 1047 || mode == 47 ?
+				    s->alt_on : mode_get(s, mode);
+
+			snprintf(rep, sizeof rep, "\033[?%d;%d$y", mode,
+			    v < 0 ? 0 : v ? 1 : 2);
 			vt_reply(w, rep);
 		}
 		break;
@@ -1921,6 +2092,7 @@ do_csi(struct dv_window *w, int final)
 	default:
 		break;
 	}
+    if (!was_reporting_focus && s->focus_report) dv_window_report_focus(w, true);
 }
 
 static void
@@ -1992,7 +2164,8 @@ osc66_int(const char *m, size_t n, char key, int def)
 			size_t	j = i + 2;
 
 			while (j < n && m[j] >= '0' && m[j] <= '9') {
-				v = v * 10 + (m[j] - '0');
+				if (v < 100000)
+					v = v * 10 + (m[j] - '0');
 				j++;
 				any = 1;
 			}
@@ -2001,12 +2174,98 @@ osc66_int(const char *m, size_t n, char key, int def)
 	return (def);
 }
 
+/* Is a run's id in use by a window of this one's session, where a desk cell
+ * is looked up, or by this screen? */
+static int
+stext_id_used(const struct dv_window *w, unsigned id)
+{
+	const struct dv_window	*o;
+
+	if (w->screen.stexts != nullptr && w->screen.stexts->contains(id))
+		return (1);
+	if (w->session == nullptr)
+		return (0);
+	TAILQ_FOREACH(o, &w->session->desktop.windows, entry)
+		if (o->screen.stexts != nullptr && o->screen.stexts->contains(id))
+			return (1);
+	return (0);
+}
+
 /*
- * OSC 66 text sizing: ESC ] 66 ; s=..:w=.. ; text ST. Lay the text as a
- * run occupying (base width * scale) columns by (scale) rows, mark those
- * cells so the compositor can reproduce it, and advance the cursor by the
- * scaled width on the same row -- which is also how a program detects
- * that we support the protocol (its CPR probe sees the cursor move).
+ * A run's id: the next of its id space, which a desk cell carries with no
+ * word of its window. Once every id has been given out the count starts
+ * again, past those some window still holds.
+ */
+static unsigned
+stext_id_alloc(const struct dv_window *w)
+{
+	static unsigned	next = DV_STEXT_FIRST;
+	static int	wrapped;
+
+	for (;;) {
+		unsigned	id = next++;
+
+		if (next == DV_STEXT_END) {
+			next = DV_STEXT_FIRST;
+			wrapped = 1;
+		}
+		if (!wrapped || !stext_id_used(w, id))
+			return (id);
+	}
+}
+
+/*
+ * Runs no cell names any more are forgotten: a program that redraws its
+ * sized text leaves the old runs behind with every frame. Looked for when
+ * twice as many are held as were in use after the last sweep, so the work
+ * is in proportion to the runs made.
+ */
+static void
+stext_sweep(struct dv_screen *s)
+{
+	std::unordered_set<unsigned>	 live;
+	size_t				 cells = (size_t)s->cols * s->rows;
+
+	if (s->stexts == nullptr || s->stexts->size() < s->stext_sweep)
+		return;
+	auto scan = [&live](const struct dv_cell *c, size_t n) {
+		bool	any = false;
+
+		for (size_t i = 0; i < n; i++)
+			if (c[i].ch == DV_STEXT_MARK) {
+				live.insert(c[i].fg);
+				any = true;
+			}
+		return (any);
+	};
+	scan(s->cells, cells);
+	if (s->alt != nullptr)
+		scan(s->alt, cells);
+	if (s->sb_stext) {
+		bool	any = false;
+
+		for (unsigned i = 0; i < s->sb_len; i++) {
+			unsigned	at = (s->sb_head + i) % s->sb_cap;
+
+			if (scan(s->sb[at], s->sb_w[at]))
+				any = true;
+		}
+		s->sb_stext = any;
+	}
+	std::erase_if(*s->stexts, [&live](const auto &entry) {
+		return (!live.contains(entry.first));
+	});
+	s->stext_sweep = std::max<size_t>(64, 2 * s->stexts->size());
+}
+
+/*
+ * OSC 66 text sizing: ESC ] 66 ; s=..:w=..:n=..:d=..:v=..:h=.. ; text ST.
+ * Lay the text as a run occupying (base width * scale) columns by (scale)
+ * rows, mark those cells so the compositor can reproduce it, and advance
+ * the cursor by the scaled width on the same row -- which is also how a
+ * program detects that we support the protocol (its CPR probe sees the
+ * cursor move). The fractional scale (n/d) and its alignment change how
+ * the text is drawn in those cells, not the cells, and go on with the run.
  */
 static void
 osc66(struct dv_window *w, const char *t, size_t n)
@@ -2014,9 +2273,9 @@ osc66(struct dv_window *w, const char *t, size_t n)
 	struct dv_screen	*s = &w->screen;
 	const char		*meta, *text;
 	size_t			 i, mlen, tlen;
-	int			 sc, wp, slotn = -1, q;
+	int			 sc, wp, fn, fd, va, ha;
 	unsigned		 bw, cols, rows, rr, cc, id, sr, sco;
-	struct dv_stext		*r;
+	struct dv_stext		 run;
 
 	for (i = 0; i < n && t[i] != ';'; i++)	/* past "66" */
 		;
@@ -2033,6 +2292,10 @@ osc66(struct dv_window *w, const char *t, size_t n)
 
 	sc = osc66_int(meta, mlen, 's', 1);
 	wp = osc66_int(meta, mlen, 'w', 0);
+	fn = osc66_int(meta, mlen, 'n', 0);
+	fd = osc66_int(meta, mlen, 'd', 0);
+	va = osc66_int(meta, mlen, 'v', 0);
+	ha = osc66_int(meta, mlen, 'h', 0);
 	if (sc < 1)
 		sc = 1;
 	if (sc > 7)
@@ -2041,6 +2304,13 @@ osc66(struct dv_window *w, const char *t, size_t n)
 		wp = 0;
 	if (wp > 7)
 		wp = 7;
+	/* A fraction is n of d parts with d the larger; anything else is none. */
+	if (fn < 1 || fn > 15 || fd > 15 || fd <= fn)
+		fn = fd = 0;
+	if (va < 0 || va > 2)
+		va = 0;
+	if (ha < 0 || ha > 2)
+		ha = 0;
 
 	if (wp > 0)
 		bw = (unsigned)wp;
@@ -2077,46 +2347,37 @@ osc66(struct dv_window *w, const char *t, size_t n)
 		if (bw == 0)
 			bw = 1;
 	}
+	/* A run is one rectangle of this screen's cells. */
+	if (bw > UINT16_MAX / 7)
+		bw = UINT16_MAX / 7;
 	cols = bw * (unsigned)sc;
 	rows = (unsigned)sc;
 	if (cols == 0)
 		return;
 
-	for (q = 0; q < DV_STEXTS; q++)		/* a free slot, else the oldest */
-		if (!s->stext[q].used) {
-			slotn = q;
-			break;
-		}
-	if (slotn < 0) {
-		int	best = 0;
+	run.s = (uint8_t)sc;
+	run.wparam = (uint8_t)wp;
+	run.n = (uint8_t)fn;
+	run.d = (uint8_t)fd;
+	run.v = (uint8_t)va;
+	run.h = (uint8_t)ha;
+	run.bw = (uint16_t)bw;
+	run.cols = (uint16_t)cols;
+	run.rows = (uint16_t)rows;
+	run.fg = s->fg;
+	run.bg = s->bg;
+	run.attr = s->attr;
+	run.font = s->font;
+	run.depth = s->depth;
+	/* The protocol's own limit: a longer text is not one run. */
+	run.text.assign(text, std::min<size_t>(tlen, DV_STEXT_TEXT_MAX));
 
-		for (q = 1; q < DV_STEXTS; q++)
-			if (s->stext[q].gen < s->stext[best].gen)
-				best = q;
-		free(s->stext[best].text);
-		slotn = best;
+	stext_sweep(s);
+	if (s->stexts == nullptr) {
+		s->stexts = new std::unordered_map<unsigned, dv_stext>;
+		s->stext_sweep = 64;
 	}
-	r = &s->stext[slotn];
-	memset(r, 0, sizeof *r);
-	r->used = 1;
-	r->gen = ++s->stext_gen;
-	r->s = (uint8_t)sc;
-	r->wparam = (uint8_t)wp;
-	r->bw = (uint16_t)bw;
-	r->cols = (uint16_t)cols;
-	r->rows = (uint16_t)rows;
-	r->fg = s->fg;
-	r->bg = s->bg;
-	r->attr = s->attr;
-	r->len = (uint16_t)(tlen > 4096 ? 4096 : tlen);
-	r->text = (char *)malloc(r->len);
-	if (r->text == nullptr) {
-		r->used = 0;
-		return;
-	}
-	memcpy(r->text, text, r->len);
-
-	id = DV_STEXT_FIRST + ((unsigned)w->id << 8) + (unsigned)slotn;
+	id = stext_id_alloc(w);
 	sr = s->cr;
 	sco = s->cc >= s->cols ? s->cols - 1 : s->cc;
 	for (rr = 0; rr < rows; rr++)
@@ -2127,13 +2388,16 @@ osc66(struct dv_window *w, const char *t, size_t n)
 				continue;
 			cell->ch = DV_STEXT_MARK;
 			cell->fg = id;
-			cell->bg = r->bg;
+			cell->bg = run.bg;
 			cell->attr = 0;
 			cell->ustyle = 0;
 			cell->ucolor = DV_COLOR_DEFAULT;
+			cell->font = run.font;
+			cell->depth = run.depth;
 			cell->irow = (uint16_t)rr;
 			cell->icol = (uint16_t)cc;
 		}
+	s->stexts->emplace(id, std::move(run));
 	s->cc = (sco + cols <= s->cols) ? sco + cols : s->cols;
 	s->last_ch = 0;
 }
@@ -2143,23 +2407,19 @@ struct dv_stext *
 dv_stext_lookup(struct dv_session *s, unsigned id, struct dv_window **wp)
 {
 	struct dv_window	*w;
-	unsigned		 win, slotn;
 
-	if (id < DV_STEXT_FIRST)
+	if (id < DV_STEXT_FIRST || id >= DV_STEXT_END)
 		return (nullptr);
-	win = (id - DV_STEXT_FIRST) >> 8;
-	slotn = (id - DV_STEXT_FIRST) & 0xff;
-	if (slotn >= DV_STEXTS)
-		return (nullptr);
-	TAILQ_FOREACH(w, &s->desktop.windows, entry)
-		if (w->id == win) {
-			struct dv_stext	*r = &w->screen.stext[slotn];
+	TAILQ_FOREACH(w, &s->desktop.windows, entry) {
+		if (w->screen.stexts == nullptr)
+			continue;
+		auto it = w->screen.stexts->find(id);
 
-			if (!r->used)
-				return (nullptr);
+		if (it != w->screen.stexts->end()) {
 			*wp = w;
-			return (r);
+			return (&it->second);
 		}
+	}
 	return (nullptr);
 }
 
@@ -2337,6 +2597,25 @@ forward_osc(struct dv_window *w)
 	dv_buf_append(&w->host_out, "\033]", 2);
 	dv_buf_append(&w->host_out, w->cap.data, w->cap.len);
 	dv_buf_append(&w->host_out, "\033\\", 2);
+}
+
+static void
+notification_to_host(struct dv_window *w)
+{
+    if (!w->session) return;
+    try {
+        if (!w->session->notification_scope)
+            w->session->notification_scope = xstrdup(odin_notification::nonce().c_str());
+        auto result = odin_notification::forward(w->session->notification_scope, w->id,
+            std::string_view((const char *)w->cap.data, w->cap.len),
+            w->notification_pending ? w->notification_pending : "");
+        dv_strset(&w->notification_pending, result.pending.c_str());
+        dv_buf_append(&w->host_out, result.bytes.data(), result.bytes.size());
+    } catch (const std::invalid_argument &) {
+        return;
+    } catch (const std::exception &error) {
+        dv_fatal("notification routing: %s", error.what());
+    }
 }
 
 /* Remember that the host's reply for (osc, id) belongs to this window. */
@@ -2827,12 +3106,20 @@ osc21(struct dv_window *w, const char *b, size_t n)
 void
 dv_window_apply_pointer(struct dv_window *w)
 {
-	char	buf[80];
-	int	n;
+	char	buf[80], image[sizeof w->pshape[0]];
+	int	n, i;
 
-	if (w->npshape > 0)
+	/* An image the window does not have is ignored, and the shape below
+	 * it shows, until the image comes. The host knows images by our ids. */
+	for (i = w->npshape - 1; i >= 0; i--) {
+		if (strncmp(w->pshape[i], "image:", 6) != 0)
+			break;
+		if (dv_kitty_pointer_image(w, w->pshape[i], image, sizeof image))
+			break;
+	}
+	if (i >= 0)
 		n = snprintf(buf, sizeof buf, "\033]22;%s\033\\",
-		    w->pshape[w->npshape - 1]);
+		    strncmp(w->pshape[i], "image:", 6) == 0 ? image : w->pshape[i]);
 	else
 		n = snprintf(buf, sizeof buf, "\033]22;\033\\");
 	if (n > 0)
@@ -2895,6 +3182,173 @@ osc22(struct dv_window *w, const char *b, size_t n)
 }
 
 /*
+ * The window's title from OSC 0/2 or ConEmu's OSC 9;3. The frame holds
+ * what fits of it; a cut never splits a UTF-8 sequence.
+ */
+static void
+set_title(struct dv_window *w, const char *t, size_t n)
+{
+	if (n >= sizeof w->title) {
+		n = sizeof w->title - 1;
+		while (n > 0 && ((unsigned char)t[n] & 0xc0) == 0x80)
+			n--;
+	}
+	memcpy(w->title, t, n);
+	w->title[n] = '\0';
+}
+
+/* A shell prompt begins (OSC 133;A, or ConEmu's OSC 9;12). */
+static void
+prompt_start(struct dv_window *w)
+{
+	dv_silkie_reset_pane(w);
+	w->screen.depth = 0;		/* and its stereo depth */
+	dv_pstatus_prompt(w);		/* what was running is over */
+}
+
+/* Percent-decoding of a file:// URL's path; false when malformed. */
+static bool
+pct_decode(std::string_view in, std::string *out)
+{
+	out->clear();
+	for (size_t i = 0; i < in.size(); i++) {
+		unsigned char	c = (unsigned char)in[i];
+
+		if (c == '%') {
+			int	v = 0;
+
+			if (i + 2 >= in.size())
+				return (false);
+			for (int k = 1; k <= 2; k++) {
+				unsigned char	h = (unsigned char)in[i + k];
+
+				v <<= 4;
+				if (h >= '0' && h <= '9')
+					v |= h - '0';
+				else if (h >= 'a' && h <= 'f')
+					v |= h - 'a' + 10;
+				else if (h >= 'A' && h <= 'F')
+					v |= h - 'A' + 10;
+				else
+					return (false);
+			}
+			out->push_back((char)v);
+			i += 2;
+		} else
+			out->push_back((char)c);
+	}
+	return (true);
+}
+
+/* The program's working directory, for the windows split from it. */
+static void
+set_cwd(struct dv_window *w, const std::string &dir)
+{
+	if (dir.empty() || dir[0] != '/' || dir.find('\0') != dir.npos)
+		return;
+	/* The window keeps a path the OS can chdir to; no longer one is. */
+	if (dir.size() >= sizeof w->cwd)
+		return;
+	dv_strlcpy(w->cwd, dir.c_str(), sizeof w->cwd);
+}
+
+/* OSC 7 ; file://host/path: the working directory, percent-encoded. */
+static void
+osc7(struct dv_window *w, const char *body, size_t bn)
+{
+	std::string_view	v(body, bn);
+	std::string		dir;
+	size_t			slash;
+
+	if (!v.starts_with("file://"))
+		return;
+	v.remove_prefix(7);
+	slash = v.find('/');
+	if (slash == v.npos)
+		return;
+	if (pct_decode(v.substr(slash), &dir))
+		set_cwd(w, dir);
+}
+
+/* A ConEmu text argument: one pair of enclosing double quotes removed. */
+static std::string_view
+unquote(std::string_view v)
+{
+	if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+		return (v.substr(1, v.size() - 2));
+	return (v);
+}
+
+/*
+ * OSC 9. ConEmu numbers its sub-commands 1-12, the number followed by ';'
+ * or the end; anything else -- "13;text" included -- is iTerm2's
+ * notification, the whole payload its title. Of ConEmu's: 2 is a message
+ * box (a notification), 3 the title, 4 progress (a status record, never a
+ * notification), 9 the working directory, 12 a prompt mark. The rest
+ * (sleep, wait for a key, run a macro or a process, print a variable,
+ * xterm emulation) are not for a program to make its terminal do, and 11
+ * is a comment: all ignored.
+ */
+static void
+osc9(struct dv_window *w, const char *body, size_t bn)
+{
+	std::string_view	v(body, bn), arg;
+	unsigned		sub = 0;
+	size_t			k = 0;
+
+	while (k < v.size() && k < 3 && v[k] >= '0' && v[k] <= '9') {
+		sub = sub * 10 + (unsigned)(v[k] - '0');
+		k++;
+	}
+	if (k == 0 || k == 3 || sub < 1 || sub > 12 ||
+	    (k < v.size() && v[k] != ';') || (k > 1 && v[0] == '0')) {
+		notification_to_host(w);
+		return;
+	}
+	arg = k < v.size() ? v.substr(k + 1) : std::string_view();
+	switch (sub) {
+	case 2: {				/* message box: a notification */
+		std::string	raw = "9;" + std::string(unquote(arg));
+		struct dv_buf	keep = w->cap;
+
+		/* notification_to_host reads the OSC from w->cap. */
+		memset(&w->cap, 0, sizeof w->cap);
+		dv_buf_append(&w->cap, raw.data(), raw.size());
+		notification_to_host(w);
+		dv_buf_free(&w->cap);
+		w->cap = keep;
+		return;
+	}
+	case 3: {				/* the title; empty: the default */
+		std::string	t(unquote(arg));
+
+		if (w->title_locked)
+			return;
+		if (t.empty())
+			t = w->cmd;
+		set_title(w, t.data(), t.size());
+		if (w->session != nullptr)
+			w->session->dirty = 1;
+		return;
+	}
+	case 4:					/* progress */
+		dv_pstatus_progress(w, body + k, bn - k);
+		return;
+	case 9: {				/* the working directory */
+		std::string	dir(unquote(arg));
+
+		set_cwd(w, dir);
+		return;
+	}
+	case 12:
+		prompt_start(w);
+		return;
+	default:
+		return;
+	}
+}
+
+/*
  * A complete OSC from the program. The number selects: window title
  * (0/2), colours (4/104/10-12/110-112/21, per-window), pointer shape
  * (22), clipboard (52 and kitty's 5522), text sizing (66), notifications
@@ -2926,14 +3380,9 @@ osc_done(struct dv_window *w)
 	case 0:
 	case 2:					/* window title */
 		if (k == 1 && n >= 2 && t[1] == ';') {
-			char	buf[64];
-			size_t	l = n - 2 < sizeof buf - 1 ? n - 2 : sizeof buf - 1;
-
 			if (w->title_locked)
 				return;
-			memcpy(buf, t + 2, l);
-			buf[l] = '\0';
-			dv_strlcpy(w->title, buf, sizeof w->title);
+			set_title(w, t + 2, n - 2);
 		}
 		return;
 	case 4:
@@ -2959,12 +3408,14 @@ osc_done(struct dv_window *w)
 		osc22(w, body, bn);
 		return;
 	case 30001:				/* push the colour state */
-		if (w->screen.npal < 4)
-			w->screen.palstack[w->screen.npal++] = w->screen.pal;
+		if (w->screen.palstack == nullptr)
+			w->screen.palstack = new std::vector<struct dv_palette>;
+		w->screen.palstack->push_back(w->screen.pal);
 		return;
 	case 30101:				/* pop it */
-		if (w->screen.npal > 0) {
-			w->screen.pal = w->screen.palstack[--w->screen.npal];
+		if (w->screen.palstack != nullptr && !w->screen.palstack->empty()) {
+			w->screen.pal = w->screen.palstack->back();
+			w->screen.palstack->pop_back();
 			if (w->session != nullptr && w->session->desktop.focused == w)
 				dv_window_apply_cursor_color(w);
 		}
@@ -2987,10 +3438,17 @@ osc_done(struct dv_window *w)
 	case 66:
 		osc66(w, t, n);
 		return;
-	case 99:				/* desktop notification: the host shows it */
-		idl = dv_meta_val(body, ml, "i", id, sizeof id);
-		forward_osc(w);
-		dv_route_expect(w, 99, id, idl);
+	case 9:
+		osc9(w, body, bn);
+		return;
+	case 7:
+		osc7(w, body, bn);
+		return;
+	case 7501:				/* program status: kept here */
+		dv_pstatus_osc(w, body, bn);
+		return;
+	case 99:
+		notification_to_host(w);
 		return;
 	case 5522:				/* kitty clipboard: the host's clipboard */
 		idl = dv_meta_val(body, ml, "id", id, sizeof id);
@@ -2999,9 +3457,17 @@ osc_done(struct dv_window *w)
 		return;
 	case 133:				/* shell prompt mark: A resets this pane */
 		if (bn > 0 && body[0] == 'A')
-			dv_silkie_reset_pane(w);
+			prompt_start(w);
 		return;
     case 777: { /* namespaced Goblin extensions */
+        if (std::string_view(t, n).starts_with("777;ssh-agent;")) {
+            if (dv_agent_app_hook) dv_agent_app_hook(w, t, n);
+            return;
+        }
+        if (std::string_view(t, n).starts_with("777;notify;")) {
+            notification_to_host(w);
+            return;
+        }
         if (dv_silkie_program(w, t, n))
             return;
         auto *s = &w->screen;
@@ -3067,7 +3533,7 @@ apc_done(struct dv_window *w)
 	/*
 	 * The window is a kitty endpoint: hand the APC to the graphics
 	 * store, which reassembles it and answers the program. The bytes
-	 * are not forwarded to the host -- goblin-view re-emits its own (kitty.cc).
+	 * are not forwarded to the host -- odin-seat re-emits its own (kitty.cc).
 	 */
 	if (w->cap.len >= 1 && w->cap.data[0] == 'G')
 		dv_kitty_apc(w, w->cap.data, w->cap.len);
@@ -3152,7 +3618,8 @@ csi_push(struct dv_screen *s, int is_sub)
 			s->csi_drop = 1;
 		else {
 			s->params[s->np] = s->val < 0 ? 0 : s->val;
-			s->sub[s->np] = (uint8_t)is_sub;
+			/* 1 a colon sub-parameter, | 2 an empty one (sgr_extended). */
+			s->sub[s->np] = (uint8_t)(is_sub ? (s->val < 0 ? 3 : 1) : 0);
 			s->np++;
 		}
 	}
@@ -3180,7 +3647,7 @@ tcap_value(const char *name, int *is_bool)
 
 	*is_bool = 0;
 	if (strcmp(name, "TN") == 0 || strcmp(name, "name") == 0) {
-		const char	*term = getenv("GOBLIN_VIEW_TERM");
+		const char	*term = getenv("ODIN_SEAT_TERM");
 
 		return (term != nullptr && term[0] != '\0' ? term : "xterm-256color");
 	}
@@ -3211,7 +3678,7 @@ xtgettcap(struct dv_window *w, const char *q, size_t n)
 
 	while (i <= n) {
 		size_t		st = i, j, k;
-		char		name[64], hexname[130], rep[640];
+		char		name[64], hexname[130], rep[640], headroom[32];
 		const char	*val;
 		int		is_bool, bad = 0;
 
@@ -3232,6 +3699,12 @@ xtgettcap(struct dv_window *w, const char *q, size_t n)
 		}
 		name[k] = '\0';
 		val = bad ? nullptr : tcap_value(name, &is_bool);
+		/* The HDR protocol's query: whatever the display last said. */
+		if (!bad && strcmp(name, "kitty-query-hdr_headroom") == 0 &&
+		    dv_silkie_headroom(w->session, headroom, sizeof headroom)) {
+			val = headroom;
+			is_bool = 0;
+		}
 		if (val == nullptr)
 			snprintf(rep, sizeof rep, "\033P0+r%s\033\\", hexname);
 		else if (is_bool)
@@ -3389,15 +3862,39 @@ dv_placeholder_index(uint32_t cp)
 void
 dv_vt_write(struct dv_window *w, const void *buf, size_t n)
 {
+	const unsigned char	*p = static_cast<const unsigned char *>(buf);
+	int			 ended;
+
+	if (w->screen.cells == nullptr)
+		return;
+	while (n > 0) {
+		size_t	used = dv_vt_write_frame(w, p, n, &ended);
+
+		p += used;
+		n -= used;
+	}
+}
+
+size_t
+dv_vt_write_frame(struct dv_window *w, const void *buf, size_t n, int *ended)
+{
 	struct dv_screen	*s = &w->screen;
 	const unsigned char	*p = static_cast<const unsigned char *>(buf);
 	size_t			 i;
 
+	*ended = 0;
 	if (s->cells == nullptr)
-		return;
+		return (n);
 	s->sb_off = 0;			/* new output jumps back to the bottom */
 	for (i = 0; i < n; i++) {
 		unsigned char	b = p[i];
+
+		if (s->sync_done) {	/* the byte before ended an update */
+			s->sync_done = 0;
+			*ended = 1;
+			dv_silkie_output(w);
+			return (i);
+		}
 
 		/* A multibyte character in progress. */
 		if (s->uneed > 0) {
@@ -3507,8 +4004,10 @@ dv_vt_write(struct dv_window *w, const void *buf, size_t n)
 					dv_silkie_cancel_window(w);
 				}
 				do_esc(s, b);
-				if (b == 'c')
+				if (b == 'c') {
 					dv_silkie_push(w->session);
+					dv_pstatus_reset(w);	/* every status record */
+				}
 				s->st = ST_GROUND;
 				break;
 			}
@@ -3579,5 +4078,10 @@ dv_vt_write(struct dv_window *w, const void *buf, size_t n)
 			break;
 		}
 	}
+	if (s->sync_done) {		/* the last byte ended an update */
+		s->sync_done = 0;
+		*ended = 1;
+	}
 	dv_silkie_output(w);
+	return (n);
 }

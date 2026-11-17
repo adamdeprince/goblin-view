@@ -4,9 +4,12 @@
  */
 
 #include "dv.hpp"
+#include "silkie.hpp"
 
 #include <stdio.h>
+#include <fcntl.h>
 #include <string.h>
+#include <string>
 #include <unistd.h>
 
 static int failed;
@@ -160,7 +163,8 @@ test_key_encoding(void)
 	expect_bytes("\033[57358u", "", "caps lock has no bytes");
 	expect_bytes("\033[97;1:3u", "", "a release is silent");
 	expect_bytes("\033[97;1:2u", "a", "a repeat is a press");
-	expect_bytes("\033[I", "", "focus in is not a key");
+	expect_bytes("\033[I", "\033[I", "focus in passes as display state");
+	expect_bytes("\033[O", "\033[O", "focus out passes as display state");
 	expect_bytes("hello", "hello", "a plain run stays one event");
 }
 
@@ -339,6 +343,41 @@ test_structured_keys(void)
 /* Leaving: the screen is cleared before the alternate screen is left,
  * so a terminal without one is not left showing the desktop, and what
  * we changed on the host is put back. */
+/* A host in pixel mode reports a position inside the cell. Until it
+ * confirms the mode, the same bytes are a cell, as before. */
+static void
+test_pixel_mouse(void)
+{
+	struct dv_host		h;
+	struct dv_host_ev	ev;
+
+	dv_host_init(&h);
+	h.xpixel = 10;
+	h.ypixel = 20;
+	feed(&h, "\033[<35;25;45M");
+	if (!dv_host_next(&h, &ev) || ev.type != DV_HEV_MOUSE || ev.mpix ||
+	    ev.mx != 25 || ev.my != 45)
+		fail("without pixel mode an SGR report is a cell");
+	feed(&h, "\033[?1016;2$y");
+	feed(&h, "\033[<35;25;45M");
+	if (!dv_host_next(&h, &ev) || ev.mpix)
+		fail("a reset pixel mode stays cell coordinates");
+	feed(&h, "\033[?1016;1$y");
+	feed(&h, "\033[<35;25;45M");
+	if (!dv_host_next(&h, &ev) || ev.type != DV_HEV_MOUSE || !ev.mpix ||
+	    ev.mpx != 25 || ev.mpy != 45 || ev.mx != 3 || ev.my != 3)
+		fail("pixel mode keeps the position inside the cell");
+	memcpy(h.name, "xterm(379)", 11);
+	feed(&h, "\033[<0;1;1M");
+	if (!dv_host_next(&h, &ev) || ev.mpx != 0 || ev.mpy != 0 ||
+	    ev.mx != 1 || ev.my != 1)
+		fail("xterm's first pixel is the origin");
+	memcpy(h.name, "kitty(0.40)", 12);
+	feed(&h, "\033[<0;0;0M");
+	if (!dv_host_next(&h, &ev) || ev.mpx != 0 || ev.mpy != 0 || ev.mx != 1)
+		fail("kitty's first pixel is the origin");
+}
+
 static void
 test_disable_sequence(void)
 {
@@ -365,6 +404,7 @@ test_disable_sequence(void)
 	if (strstr(buf, "\033]22;\033\\") == NULL || strstr(buf, "\033]112\033\\") == NULL)
 		fail("the pointer shape and cursor colour are reset");
 	if (strstr(buf, "\033[<u") == NULL || strstr(buf, "\033[?1003l") == NULL ||
+	    strstr(buf, "\033[?1016l") == NULL ||
 	    strstr(buf, "\033[?2004l") == NULL || strstr(buf, "\033[?25h") == NULL)
 		fail("keyboard flags, mouse tracking and paste mode are undone; the cursor shows");
 }
@@ -439,9 +479,163 @@ test_paste_passthrough(void)
 		fail("bracketed-paste end passes through as bytes");
 }
 
+/* A vector service reply is routed, whatever its size; other replies are not. */
+static void
+test_service_reply(void)
+{
+	struct dv_host		h;
+	struct dv_host_ev	ev;
+	std::string		body(300000, 'A'), wire;
+	char			id[32];
+
+	dv_host_init(&h);
+	feed(&h, "\033[?62c");			/* bootstrap over */
+	h.da = 1;
+	while (dv_host_next(&h, &ev))
+		;
+	feed(&h, "\033_Gi=31;OK\033\\");
+	if (dv_host_next(&h, &ev) && ev.type == DV_HEV_APC)
+		fail("an ordinary graphics reply stays here");
+	snprintf(id, sizeof id, "%u", DV_VREQ_FIRST + 5);
+	wire = std::string("\033_Gi=") + id + ";OK;" + body + "\033\\";
+	for (size_t off = 0; off < wire.size(); off += 4000) {
+		std::string	part = wire.substr(off, 4000);
+
+		dv_host_feed(&h, (const unsigned char *)part.data(), part.size());
+	}
+	if (!dv_host_next(&h, &ev) || ev.type != DV_HEV_APC)
+		fail("a large service reply is an event");
+	else if (h.osc.len != strlen("Gi=") + strlen(id) + 4 + body.size() ||
+	    memcmp(h.osc.data, "Gi=", 3) != 0 ||
+	    h.osc.data[h.osc.len - 1] != 'A')
+		fail("a large service reply arrives whole");
+	h.osc.len = 0;
+}
+
+/*
+ * A read can leave a long sequence exactly at the end of the key buffer. The
+ * next read moves it to the hold; until then it must not lose its ESC and fall
+ * through to the window as typing.
+ */
+static void
+test_sequence_fills_buffer(void)
+{
+	struct dv_host		h;
+	struct dv_host_ev	ev;
+	char			id[32];
+
+	snprintf(id, sizeof id, "%u", DV_VREQ_FIRST + 5);
+	const std::string	apc = std::string("\033_Gi=") + id + ";OK;";
+	const struct {
+		std::string	head;
+		char		fill;
+		std::string	tail;
+		const char	*name;
+	} seqs[] = {
+		{ apc, 'A', "\033\\", "a service reply" },
+		{ "\033P>|", 'x', "\033\\", "a DCS reply" },
+		{ "\033[", '1', "m", "a CSI" },
+	};
+
+	for (const auto &seq : seqs) {
+		for (size_t room = 0; room < 2; room++) {
+			std::string	wire = seq.head;
+			size_t		first = sizeof h.buf - room;
+			std::string	rest(16, seq.fill);
+			int		apcs = 0;
+
+			wire.append(first - wire.size(), seq.fill);
+			rest += seq.tail;
+			dv_host_init(&h);
+			feed(&h, "\033[?62c");		/* bootstrap over */
+			h.da = 1;
+			while (dv_host_next(&h, &ev))
+				;
+			dv_host_feed(&h, wire.data(), wire.size());
+			while (dv_host_next(&h, &ev))
+				if (ev.type == DV_HEV_PTY)
+					fail(seq.name);
+			dv_host_feed(&h, rest.data(), rest.size());
+			while (dv_host_next(&h, &ev)) {
+				if (ev.type == DV_HEV_PTY)
+					fail(seq.name);
+				if (ev.type == DV_HEV_APC) {
+					apcs++;
+					if (h.osc.len != wire.size() + 16 - 2 ||
+					    h.osc.data[h.osc.len - 1] != 'A')
+						fail("a reply that filled the buffer arrives whole");
+					h.osc.len = 0;
+				}
+			}
+			if (seq.fill == 'A' && apcs != 1)
+				fail("a reply that filled the buffer is an event");
+		}
+	}
+}
+
+/* The capability blob has no size of its own: a long role list must fit. */
+static void
+test_silkie_blob(void)
+{
+	struct dv_host	h;
+	std::string	roles = "default", frame;
+
+	for (int i = 0; i < 2000; i++)
+		roles += ",role" + std::to_string(i);
+	frame = "777;font;v=1:op=cap:id=17349532:caps=1:roles=" + roles;
+	dv_host_init(&h);
+	dv_silkie_note(&h, (const unsigned char *)frame.data(), frame.size());
+	if (h.silkie_blob == nullptr ||
+	    strstr(h.silkie_blob, "role1999") == nullptr)
+		fail("the blob holds what the terminal listed");
+	frame = "777;caps;v=1:op=cap:id=17349523:ext=font.1,caps.1";
+	dv_silkie_note(&h, (const unsigned char *)frame.data(), frame.size());
+	if (strstr(h.silkie_blob, "role1999") == nullptr ||
+	    strstr(h.silkie_blob, "ext=font.1") == nullptr)
+		fail("and one reply does not disturb another");
+	if (strstr(dv_silkie_probe(), "777;font;v=1:op=query:id=17349532") == nullptr)
+		fail("the bootstrap asks about fonts");
+	/* The SGR extensions and the program status query go in the blob. */
+	frame = "777;caps;v=1:op=cap:id=17349523:ext=caps.1:sgr=alpha,deep,gamut,hdr";
+	dv_silkie_note(&h, (const unsigned char *)frame.data(), frame.size());
+	if (strstr(h.silkie_blob, "sgr=alpha,deep,gamut,hdr") == nullptr)
+		fail("the sgr list of a caps reply is kept");
+	if (strstr(dv_silkie_probe(), "\033]7501;?\033\\") == nullptr)
+		fail("the bootstrap asks whether the terminal takes program status");
+	frame = "\033]7501;?:states=idle,working,done,blocked,error\033\\";
+	dv_silkie_note(&h, (const unsigned char *)frame.data(), frame.size());
+	if (strstr(h.silkie_blob, "pstatus=1") == nullptr)
+		fail("a terminal that answers OSC 7501 ? takes program status");
+}
+
+static void test_bootstrap_pending_focus() {
+    dv_host host; dv_host_init(&host);
+    dv_size size{};
+    int input[2];
+    if (pipe(input) < 0) { fail("bootstrap input pipe"); return; }
+    std::string events;
+    for (int i=0; i<256; ++i) events += "\033[I";
+    events += "\033[6;20;10t\033[8;30;100t\033[?62;22c";
+    if (write(input[1], events.data(), events.size()) != (ssize_t)events.size()) fail("bootstrap fixture write");
+    close(input[1]);
+    int output = open("/dev/null", O_WRONLY);
+    dv_host_bootstrap(&host,input[0],output,&size);
+    close(input[0]); close(output);
+    dv_host_ev event;
+    for (int i=0; i<256; ++i)
+        if (!dv_host_next(&host,&event) || event.type!=DV_HEV_PTY || event.n!=3 || memcmp(event.data,"\033[I",3))
+            fail("bootstrap preserves every focus report once without a bounded queue");
+    if (dv_host_next(&host,&event)) fail("bootstrap reports are not replayed");
+    dv_buf_free(&host.osc); dv_buf_free(&host.hold); dv_buf_free(&host.pending);
+}
+
 int
 main(void)
 {
+	test_bootstrap_pending_focus();
+	test_service_reply();
+	test_sequence_fills_buffer();
+	test_silkie_blob();
 	test_alt_tap();
 	test_alt_chord();
 	test_ctrl_backslash();
@@ -456,6 +650,7 @@ main(void)
 	test_paste_passthrough();
 	test_gfx_ok();
 	test_disable_sequence();
+	test_pixel_mouse();
 	test_xtversion();
 	test_structured_keys();
 	if (failed) {

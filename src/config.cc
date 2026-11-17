@@ -1,5 +1,5 @@
 /*
- * The configuration file: ~/.config/goblin-view/config.
+ * The configuration file: ~/.config/odin-seat/config.
  *
  *     # a comment
  *     shell = /bin/zsh
@@ -30,6 +30,7 @@ dv_config_defaults(struct dv_config *c)
 	c->scrollback = 1000;
 	c->backdrop = 0x2591;		/* light shade */
 	c->click_raises = 1;
+	c->cell_pictures = 1;
 	c->menu_key = DV_MENU_KEY_ALT | DV_MENU_KEY_CTRL_BACKSLASH;
 	c->mono = 0;
 }
@@ -38,18 +39,18 @@ const char *
 dv_config_path(void)
 {
 	static char	path[DV_PATH_MAX];
-	const char	*e = getenv("GOBLIN_VIEW_CONFIG"), *xdg, *home;
+	const char	*e = getenv("ODIN_SEAT_CONFIG"), *xdg, *home;
 
 	if (e != NULL && e[0] != '\0')
 		return (e);
 	xdg = getenv("XDG_CONFIG_HOME");
 	home = getenv("HOME");
 	if (xdg != NULL && xdg[0] == '/')
-		snprintf(path, sizeof path, "%s/goblin-view/config", xdg);
+		snprintf(path, sizeof path, "%s/odin-seat/config", xdg);
 	else if (home != NULL && home[0] != '\0')
-		snprintf(path, sizeof path, "%s/.config/goblin-view/config", home);
+		snprintf(path, sizeof path, "%s/.config/odin-seat/config", home);
 	else
-		return ("/etc/goblin-view/config");
+		return ("/etc/odin-seat/config");
 	return (path);
 }
 
@@ -149,6 +150,10 @@ apply(struct dv_config *c, const char *key, char *value)
 		if (!parse_bool(value, &b))
 			return (-2);
 		c->click_raises = b;
+	} else if (strcmp(key, "cell-pictures") == 0) {
+		if (!parse_bool(value, &b))
+			return (-2);
+		c->cell_pictures = b;
 	} else if (strcmp(key, "mono") == 0) {
 		if (!parse_bool(value, &b))
 			return (-2);
@@ -205,12 +210,12 @@ env_size(const char *name, size_t fallback)
 	return ((size_t)n);
 }
 
-/* File values, then GOBLIN_VIEW_CSI_LIMIT and GOBLIN_VIEW_ESCAPE_LIMIT. */
+/* File values, then ODIN_SEAT_CSI_LIMIT and ODIN_SEAT_ESCAPE_LIMIT. */
 void
 dv_limits_apply(const struct dv_config *c)
 {
-	dv_csi_limit = env_size("GOBLIN_VIEW_CSI_LIMIT", c->csi_limit);
-	dv_escape_limit = env_size("GOBLIN_VIEW_ESCAPE_LIMIT", c->escape_limit);
+	dv_csi_limit = env_size("ODIN_SEAT_CSI_LIMIT", c->csi_limit);
+	dv_escape_limit = env_size("ODIN_SEAT_ESCAPE_LIMIT", c->escape_limit);
 }
 
 /*

@@ -26,9 +26,9 @@ dv_saved_path(void)
 	const char	*xdg = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
 
 	if (xdg != NULL && xdg[0] == '/')
-		snprintf(path, sizeof path, "%s/goblin-view/sessions", xdg);
+		snprintf(path, sizeof path, "%s/odin-seat/sessions", xdg);
 	else
-		snprintf(path, sizeof path, "%s/.local/state/goblin-view/sessions",
+		snprintf(path, sizeof path, "%s/.local/state/odin-seat/sessions",
 		    home != NULL ? home : "/tmp");
 	return (path);
 }
@@ -125,7 +125,7 @@ dv_sessions_save(const char *path, struct dv_buf *report)
 	int			 nsess = 0, nwin = 0;
 
 	memset(&b, 0, sizeof b);
-	dv_buf_append(&b, "goblin-view-sessions 1\n", 23);
+	dv_buf_append(&b, "odin-seat-sessions 1\n", sizeof "odin-seat-sessions 1\n" - 1);
 	TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
 		nsess++;
 		snprintf(line, sizeof line, "session %u %u\n", s->desktop.cols, s->desktop.rows);
@@ -192,9 +192,10 @@ dv_sessions_restore(const char *path, struct dv_buf *report)
 		dv_buf_append(report, msg, strlen(msg));
 		return (0);
 	}
-	if (fgets(line, sizeof line, f) == NULL || strncmp(line, "goblin-view-sessions ", 21) != 0) {
+	if (fgets(line, sizeof line, f) == NULL ||
+	    strncmp(line, "odin-seat-sessions ", sizeof "odin-seat-sessions " - 1) != 0) {
 		fclose(f);
-		snprintf(msg, sizeof msg, "%s is not a goblin-view sessions file\n", path);
+		snprintf(msg, sizeof msg, "%s is not a odin-seat sessions file\n", path);
 		dv_buf_append(report, msg, strlen(msg));
 		return (0);
 	}
@@ -225,7 +226,7 @@ dv_sessions_restore(const char *path, struct dv_buf *report)
 				skipping = 1;
 				continue;
 			}
-			if (sz.cols < 2 || sz.rows < 2) {
+			if (sz.cols == 0 || sz.rows == 0) {
 				sz.cols = 80;
 				sz.rows = 24;
 			}

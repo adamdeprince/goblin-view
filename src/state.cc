@@ -1,6 +1,6 @@
 /*
  * The running server's state, written for the binary that replaces it
- * and read back by that binary. `goblin-view upgrade` makes the server
+ * and read back by that binary. `odin-seat upgrade` makes the server
  * write it, mark its file descriptors inheritable and exec the new
  * program in place: the same process, so the programs in the windows
  * (its children) and the attached clients (its sockets) carry on. The
@@ -22,6 +22,8 @@
 #include <unistd.h>
 
 #include "dv.hpp"
+#include "pstatus.hpp"
+#include "agent.hpp"
 
 static void
 put_str(struct dv_buf *b, const char *key, const char *v)
@@ -114,8 +116,13 @@ write_screen(struct dv_buf *b, struct dv_screen *sc)
 	line(b, "silk %d %d %d %d %d %d %d %u %d", sc->silk_tablet, sc->silk_scroll,
 	    sc->silk_gesture, sc->silk_frame, sc->silk_latency, sc->silk_display,
 	    sc->silk_ink, sc->silk_frame_seq, sc->silk_frame_dirty);
-	put_str(b, "sbrush", sc->silk_brush);
-	put_str(b, "sshown", sc->silk_shown);
+	if (sc->silk_brush != nullptr)
+		put_str(b, "sbrush", sc->silk_brush);
+	if (sc->silk_shown != nullptr)
+		put_str(b, "sshown", sc->silk_shown);
+	line(b, "sfont %u", sc->font);
+	line(b, "sdepth %u", sc->depth);
+	line(b, "focus_report %d", sc->focus_report);
 	line(b, "pointer %d", sc->pointer_mode);
 	for (a = 0; a < 2; a++) {
 		struct dv_buf	k;
@@ -146,10 +153,14 @@ write_screen(struct dv_buf *b, struct dv_screen *sc)
 	for (a = 0; a < 2; a++) {
 		const struct dv_cursor_save	*c = a ? &sc->saved_alt : &sc->saved;
 
-		line(b, "csave %d %u %u %u %u %u %d %u %u %u %u %u %u %u", a, c->cr, c->cc,
-		    c->fg, c->bg, c->attr, c->valid, c->ustyle, c->ucolor, c->alpha,
-		    c->fg_br, c->bg_br, c->fg_gamut, c->bg_gamut);
+		line(b, "csave %d %u %u %u %u %u %d %u %u %u %u %u %u %u %u %u", a, c->cr,
+		    c->cc, c->fg, c->bg, c->attr, c->valid, c->ustyle, c->ucolor, c->alpha,
+		    c->fg_br, c->bg_br, c->fg_gamut, c->bg_gamut, c->font, c->depth);
+		if (c->fg_x != 0 || c->bg_x != 0 || c->u_x != 0)
+			line(b, "csdeep %d %u %u %u", a, c->fg_x, c->bg_x, c->u_x);
 	}
+	if (sc->fg_x != 0 || sc->bg_x != 0 || sc->u_x != 0)
+		line(b, "pendeep %u %u %u", sc->fg_x, sc->bg_x, sc->u_x);
 	{
 		/* main = the primary screen, alt = the alternate buffer,
 		 * whichever of the two arrays holds them right now */
@@ -195,16 +206,26 @@ dv_state_write(const char *path, const struct dv_peer *requester)
 	int			 fd;
 
 	memset(&b, 0, sizeof b);
-	line(&b, "goblin-view-state 1");
+	line(&b, "odin-seat-state 1");
 	line(&b, "version %s", DV_VERSION);
 	line(&b, "protocol %d", DV_PROTOCOL);
 	line(&b, "listen %d", dv_srv->listen_fd);
+	dv_font_save(&b);
+	dv_depth_save(&b);
 	TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
 		line(&b, "session %u %u %u %u %u %u %u %d", s->desktop.cols, s->desktop.rows,
 		    s->desktop.xpixel, s->desktop.ypixel, s->desktop.next_snap,
 		    s->desktop.cascade, s->desktop.focused ? s->desktop.focused->id : 0,
 		    s->broadcast);
 		put_str(&b, "name", s->name);
+        if (dv_agent_listener(s) >= 0) {
+            line(&b, "agent %d %d", dv_agent_listener(s), dv_agent_peer(s));
+            put_str(&b, "agent_path", dv_agent_path(s));
+            put_str(&b, "agent_scope", dv_agent_scope(s));
+            put_str(&b, "agent_peers", dv_agent_peers(s).c_str());
+        }
+		if (s->notification_scope) put_str(&b, "notification_scope", s->notification_scope);
+        line(&b, "host_unfocused %d", s->host_unfocused);
 		if (s->mark.len > 0)
 			put_b64(&b, "mark", s->mark.data, s->mark.len);
 		line(&b, "im %d", s->im.method);
@@ -230,6 +251,12 @@ dv_state_write(const char *path, const struct dv_peer *requester)
 			if (w->pty_out.len > 0)
 				put_b64(&b, "pty_out", w->pty_out.data, w->pty_out.len);
 			write_screen(&b, &w->screen);
+            line(&b, "focus_state %d", w->focus_state);
+			if (w->selected)
+				line(&b, "selected 1");
+            if (w->notification_pending) put_str(&b, "notification_pending", w->notification_pending);
+			for (const auto &rec : dv_pstatus_save(w))
+				put_str(&b, "pstatus", rec.c_str());
 			line(&b, "end");
 		}
 	}
@@ -240,7 +267,8 @@ dv_state_write(const char *path, const struct dv_peer *requester)
 		put_str(&b, "pterm", p->term);
 		put_str(&b, "phost", p->host);
 		line(&b, "ppointer %d", p->pointer_caps);
-		if (p->silkie_blob[0] != '\0')
+        line(&b, "pfocus %d", p->host_unfocused);
+		if (p->silkie_blob != nullptr && p->silkie_blob[0] != '\0')
 			put_str(&b, "psilkie", p->silkie_blob);
 		put_str(&b, "pcwd", p->cwd);
 		put_str(&b, "psession", p->session != NULL ? p->session->name : "");
@@ -248,6 +276,7 @@ dv_state_write(const char *path, const struct dv_peer *requester)
 			put_b64(&b, "pout", p->conn.out.data, p->conn.out.len);
 		if (p->conn.in.len > 0)
 			put_b64(&b, "pin", p->conn.in.data, p->conn.in.len);
+		if (p->agent_input.len) put_b64(&b, "pagent", p->agent_input.data, p->agent_input.len);
 		line(&b, "pend");
 	}
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -287,13 +316,15 @@ dv_state_inherit_fds(int on)
 	fcntl(dv_srv->listen_fd, F_SETFD, flag);
 	TAILQ_FOREACH(p, &dv_srv->peers, entry)
 		fcntl(p->fd, F_SETFD, flag);
-	TAILQ_FOREACH(s, &dv_srv->sessions, entry)
+	TAILQ_FOREACH(s, &dv_srv->sessions, entry) {
+        if (dv_agent_listener(s) >= 0) fcntl(dv_agent_listener(s), F_SETFD, flag);
 		TAILQ_FOREACH(w, &s->desktop.windows, entry) {
 			if (w->pty_fd >= 0)
 				fcntl(w->pty_fd, F_SETFD, flag);
 			if (w->pipe_fd >= 0)
 				fcntl(w->pipe_fd, F_SETFD, flag);
 		}
+    }
 }
 
 static long
@@ -322,12 +353,14 @@ dv_state_read(const char *path, int *requester_fd)
 	unsigned		 focused_id = 0, next_snap = 0, cascade = 0;
 	int			 broadcast = 0, alt_on_pending = 0;
 	int			 ok = 0;
+    int agent_fd = -1, agent_peer = -1;
 
 	*requester_fd = -1;
 	memset(&sz, 0, sizeof sz);
 	if (f == nullptr)
 		return (0);
-	if ((n = getline(&ln, &cap, f)) < 0 || strncmp(ln, "goblin-view-state ", 18) != 0) {
+	if ((n = getline(&ln, &cap, f)) < 0 ||
+	    strncmp(ln, "odin-seat-state ", sizeof "odin-seat-state " - 1) != 0) {
 		free(ln);
 		fclose(f);
 		return (0);
@@ -350,6 +383,17 @@ dv_state_read(const char *path, int *requester_fd)
 			w = nullptr;
 			sscanf(val, "%u %u %u %u %u %u %u %d", &sz.cols, &sz.rows, &sz.xpixel,
 			    &sz.ypixel, &next_snap, &cascade, &focused_id, &broadcast);
+        } else if (s != nullptr && strcmp(key, "agent") == 0) {
+            sscanf(val, "%d %d", &agent_fd, &agent_peer);
+        } else if (s != nullptr && strcmp(key, "agent_path") == 0) {
+            unescape(val);
+            if (agent_fd >= 0) dv_agent_restore(s, agent_fd, val, agent_peer);
+        } else if (s != nullptr && strcmp(key, "agent_scope") == 0) {
+            unescape(val);
+            dv_agent_restore_scope(s, val);
+        } else if (s != nullptr && strcmp(key, "agent_peers") == 0) {
+            unescape(val);
+            dv_agent_restore_peers(s, val);
 		} else if (strcmp(key, "name") == 0) {
 			unescape(val);
 			s = dv_session_create(val, sz);
@@ -357,6 +401,20 @@ dv_state_read(const char *path, int *requester_fd)
 			s->desktop.cascade = cascade;
 			s->broadcast = broadcast;
 			s->dirty = 1;
+		} else if (s != nullptr && strcmp(key, "host_unfocused") == 0) {
+            s->host_unfocused = atoi(val);
+        } else if (w != nullptr && strcmp(key, "focus_report") == 0) {
+            w->screen.focus_report = atoi(val);
+        } else if (w != nullptr && strcmp(key, "focus_state") == 0) {
+            w->focus_state = atoi(val);
+		} else if (w != nullptr && strcmp(key, "selected") == 0) {
+			w->selected = atoi(val) != 0;
+        } else if (w != nullptr && strcmp(key, "notification_pending") == 0) {
+            dv_strset(&w->notification_pending, val);
+        } else if (p != nullptr && strcmp(key, "pfocus") == 0) {
+            p->host_unfocused = atoi(val);
+        } else if (s != nullptr && strcmp(key, "notification_scope") == 0) {
+            dv_strset(&s->notification_scope, val);
 		} else if (s != nullptr && strcmp(key, "mark") == 0) {
 			b64_decode_into(val, &s->mark);
 		} else if (s != nullptr && strcmp(key, "im") == 0) {
@@ -407,6 +465,9 @@ dv_state_read(const char *path, int *requester_fd)
 		} else if (w != nullptr && strcmp(key, "cmd") == 0) {
 			unescape(val);
 			dv_strlcpy(w->cmd, val, sizeof w->cmd);
+		} else if (w != nullptr && strcmp(key, "pstatus") == 0) {
+			unescape(val);
+			dv_pstatus_restore(w, val);
 		} else if (w != nullptr && strcmp(key, "cwd") == 0) {
 			unescape(val);
 			dv_strlcpy(w->cwd, val, sizeof w->cwd);
@@ -451,6 +512,21 @@ dv_state_read(const char *path, int *requester_fd)
 			sc->bg_gamut = (uint8_t)bgg;
 			if (cols != sc->cols || rows != sc->rows)
 				dv_screen_resize(sc, cols, rows);
+		} else if (w != nullptr && strcmp(key, "pendeep") == 0) {
+			sscanf(val, "%u %u %u", &w->screen.fg_x, &w->screen.bg_x,
+			    &w->screen.u_x);
+		} else if (w != nullptr && strcmp(key, "csdeep") == 0) {
+			int		 a = 0;
+			unsigned	 fx = 0, bx = 0, ux = 0;
+
+			if (sscanf(val, "%d %u %u %u", &a, &fx, &bx, &ux) == 4) {
+				struct dv_cursor_save	*c = a ? &w->screen.saved_alt :
+				    &w->screen.saved;
+
+				c->fg_x = fx;
+				c->bg_x = bx;
+				c->u_x = ux;
+			}
 		} else if (w != nullptr && strcmp(key, "silk") == 0) {
 			unsigned	seq = 0;
 			int		tab, scr, ges, fr, lat, disp, ink, dirty;
@@ -469,10 +545,23 @@ dv_state_read(const char *path, int *requester_fd)
 			}
 		} else if (w != nullptr && strcmp(key, "sbrush") == 0) {
 			unescape(val);
-			dv_strlcpy(w->screen.silk_brush, val, sizeof w->screen.silk_brush);
+			dv_strset(&w->screen.silk_brush, val);
 		} else if (w != nullptr && strcmp(key, "sshown") == 0) {
 			unescape(val);
-			dv_strlcpy(w->screen.silk_shown, val, sizeof w->screen.silk_shown);
+			dv_strset(&w->screen.silk_shown, val);
+		} else if (w != nullptr && strcmp(key, "sfont") == 0) {
+			w->screen.font = (uint32_t)strtoul(val, nullptr, 10);
+		} else if (w != nullptr && strcmp(key, "sdepth") == 0) {
+			w->screen.depth = (uint32_t)strtoul(val, nullptr, 10);
+		} else if (strcmp(key, "dstyle") == 0) {
+			(void)dv_depth_restore(val);
+		} else if (strcmp(key, "fstyle") == 0) {
+			unsigned	id;
+			int		weight, slant, used = 0;
+
+			if (sscanf(val, "%u %d %d %n", &id, &weight, &slant, &used) == 3 &&
+			    used > 0)
+				dv_font_restore(id, val + used, weight, slant);
 		} else if (w != nullptr && strcmp(key, "pointer") == 0) {
 			w->screen.pointer_mode = atoi(val) == 1;
 		} else if (w != nullptr && strcmp(key, "kbd") == 0) {
@@ -540,13 +629,16 @@ dv_state_read(const char *path, int *requester_fd)
 			struct dv_cursor_save	 c;
 
 			unsigned		 alpha = 100, fgbr = 100, bgbr = 100, fgg = 0, bgg = 0;
+			unsigned		 font = 0, depth = 0;
 
 			memset(&c, 0, sizeof c);
 			c.alpha = 100;
 			c.fg_br = c.bg_br = 100;
-			if (sscanf(val, "%d %u %u %u %u %u %d %u %u %u %u %u %u %u", &a, &c.cr,
-			    &c.cc, &c.fg, &c.bg, &attr, &c.valid, &ustyle, &c.ucolor, &alpha,
-			    &fgbr, &bgbr, &fgg, &bgg) >= 9) {
+			if (sscanf(val, "%d %u %u %u %u %u %d %u %u %u %u %u %u %u %u %u", &a,
+			    &c.cr, &c.cc, &c.fg, &c.bg, &attr, &c.valid, &ustyle, &c.ucolor,
+			    &alpha, &fgbr, &bgbr, &fgg, &bgg, &font, &depth) >= 9) {
+				c.font = font;
+				c.depth = depth;
 				c.attr = (uint8_t)attr;
 				c.ustyle = (uint8_t)ustyle;
 				c.alpha = (uint8_t)alpha;
@@ -617,7 +709,7 @@ dv_state_read(const char *path, int *requester_fd)
             p->pointer_caps = atoi(val) & 7;
 		} else if (p != nullptr && strcmp(key, "psilkie") == 0) {
 			unescape(val);
-			dv_strlcpy(p->silkie_blob, val, sizeof p->silkie_blob);
+			dv_strset(&p->silkie_blob, val);
         } else if (strcmp(key, "peer") == 0) {
 			int	fd, display, identified, features, req, vx, vy;
 			struct dv_size	t;
@@ -658,6 +750,8 @@ dv_state_read(const char *path, int *requester_fd)
 			b64_decode_into(val, &p->conn.out);
 		} else if (p != nullptr && strcmp(key, "pin") == 0) {
 			b64_decode_into(val, &p->conn.in);
+		} else if (p != nullptr && strcmp(key, "pagent") == 0) {
+            b64_decode_into(val,&p->agent_input);
 		} else if (strcmp(key, "pend") == 0) {
 			p = nullptr;
 		}

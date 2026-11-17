@@ -4,7 +4,7 @@
 set -e
 
 DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-GV="${GV:-$DIR/goblin-view}"
+GV="${GV:-$DIR/odin-seat}"
 L="t$$"
 export GV
 
@@ -51,7 +51,7 @@ after=$("$GV" -L "$L" list-windows | grep ':2:')
 	fail "move should change window 2 geometry"
 }
 
-# Closing a non-last window (here window 1, the first) must NOT quit goblin-view:
+# Closing a non-last window (here window 1, the first) must NOT quit odin-seat:
 # the other windows stay and the server lives on.
 "$GV" -L "$L" menu o || fail "menu open 3"
 "$GV" -L "$L" menu 1 || fail "focus window 1"

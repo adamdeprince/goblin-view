@@ -32,9 +32,9 @@ dv_socket_path(const char *label, const char *path_override)
 		label = "default";
 	base = getenv("XDG_RUNTIME_DIR");
 	if (base != NULL && base[0] != '\0')
-		dir = xasprintf("%s/goblin-view", base);
+		dir = xasprintf("%s/odin-seat", base);
 	else
-		dir = xasprintf("/tmp/goblin-view-%u", (unsigned)dv_uid());
+		dir = xasprintf("/tmp/odin-seat-%u", (unsigned)dv_uid());
 	path = xasprintf("%s/%s", dir, label);
 	free(dir);
 	return (path);
@@ -92,7 +92,9 @@ dv_socket_listen(const char *sock_path)
 		close(fd);
 		return (-1);
 	}
-	if (listen(fd, 16) < 0) {
+	/* As many pending clients as the system allows: a burst of commands from
+	 * scripts must not be refused while the server is busy. */
+	if (listen(fd, SOMAXCONN) < 0) {
 		close(fd);
 		unlink(sock_path);
 		return (-1);

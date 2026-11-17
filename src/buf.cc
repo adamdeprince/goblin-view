@@ -11,11 +11,14 @@ dv_buf_append(struct dv_buf *b, const void *p, size_t n)
 {
 	if (n == 0)
 		return;
+	if (n > SIZE_MAX - b->len) dv_fatal("buffer size overflow");
 	if (b->len + n > b->space) {
 		size_t	sp = b->space ? b->space : 256;
 
-		while (sp < b->len + n)
+		while (sp < b->len + n) {
+            if (sp > SIZE_MAX / 2) { sp = b->len + n; break; }
 			sp *= 2;
+        }
 		b->data = dv_resize(b->data, sp);
 		b->space = sp;
 	}

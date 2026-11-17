@@ -8,6 +8,8 @@
  */
 
 #include "dv.hpp"
+#include "ssh_agent.hpp"
+#include <memory>
 
 #include <sys/ioctl.h>
 
@@ -84,7 +86,7 @@ set_raw(void)
 }
 
 /*
- * GOBLIN_VIEW_TRACE=path: append everything painted to the host there, so a frame
+ * ODIN_SEAT_TRACE=path: append everything painted to the host there, so a frame
  * the terminal did not show can be told from one that was never sent.
  */
 static void
@@ -93,7 +95,7 @@ trace_bytes(const void *p, size_t n)
 	static int	trace_fd = -2;
 
 	if (trace_fd == -2) {
-		const char	*t = getenv("GOBLIN_VIEW_TRACE");
+		const char	*t = getenv("ODIN_SEAT_TRACE");
 
 		trace_fd = (t != NULL && *t != '\0') ?
 		    open(t, O_WRONLY | O_CREAT | O_APPEND, 0600) : -1;
@@ -276,15 +278,29 @@ send_identify(struct dv_conn *c, int display, struct dv_size sz,
 	dv_buf_append(&b, &pc, 1);
 	{
 		size_t		bn = silkie != nullptr ? strlen(silkie) : 0;
-		unsigned char	hl[2];
+		unsigned char	hl[4];
 
-		if (bn > 2047)
-			bn = 2047;
-		hl[0] = (unsigned char)(bn >> 8);
-		hl[1] = (unsigned char)bn;
-		dv_buf_append(&b, hl, 2);
+		hl[0] = (unsigned char)(bn >> 24);
+		hl[1] = (unsigned char)(bn >> 16);
+		hl[2] = (unsigned char)(bn >> 8);
+		hl[3] = (unsigned char)bn;
+		dv_buf_append(&b, hl, 4);
 		if (bn != 0)
 			dv_buf_append(&b, silkie, bn);
+	}
+	{
+		/* --3d-focus, as text that gives the same float back. */
+		char		fx[32];
+		int		fn = display && dv_focus_px != 0.0f ?
+				    snprintf(fx, sizeof fx, "%.9g", (double)dv_focus_px) : 0;
+		unsigned char	hl[2];
+
+		if (fn < 0)
+			fn = 0;
+		hl[0] = (unsigned char)(fn >> 8);
+		hl[1] = (unsigned char)fn;
+		dv_buf_append(&b, hl, 2);
+		dv_buf_append(&b, fx, (size_t)fn);
 	}
 	rc = dv_conn_send(c, DV_MSG_IDENTIFY, b.data, b.len);
 	dv_buf_free(&b);
@@ -333,14 +349,29 @@ send_menu_word(struct dv_conn *c, const char *word)
 	return (send_command(c, av));
 }
 
+static void agent_service(dv_conn *c, terminal_agent::Client *agent) {
+    if (!agent) return;
+    agent->tick();
+    for (const auto &raw : agent->take_terminal()) tty_passthrough(STDOUT_FILENO,reinterpret_cast<const unsigned char *>(raw.data()),raw.size());
+    for (const auto &raw : agent->take_remote()) dv_conn_send_agent(c,raw.data(),raw.size());
+}
+
 static void
 handle_host_ev(struct dv_conn *c, struct dv_host *h, struct dv_host_ev *ev,
-    struct dv_size *sz)
+    struct dv_size *sz, terminal_agent::Client *agent)
 {
 	switch (ev->type) {
 	case DV_HEV_OSC:	/* the host answered a window's OSC query */
+        if (agent && agent->from_terminal(std::string((const char *)h->osc.data,h->osc.len))) {
+            h->osc.len=0; agent_service(c,agent); break;
+        }
 		if (h->osc.len > 0)
 			dv_conn_send(c, DV_MSG_OSC, h->osc.data, h->osc.len);
+		h->osc.len = 0;
+		break;
+	case DV_HEV_APC:	/* the host answered a window's vector request */
+		if (h->osc.len > 0)
+			dv_conn_send(c, DV_MSG_APC, h->osc.data, h->osc.len);
 		h->osc.len = 0;
 		break;
 	case DV_HEV_SIZE:
@@ -358,7 +389,8 @@ handle_host_ev(struct dv_conn *c, struct dv_host *h, struct dv_host_ev *ev,
 		send_menu_word(c, "menu");
 		break;
 	case DV_HEV_MOUSE: {
-		unsigned char	m[7];
+		unsigned char	m[15];
+		unsigned	u;
 
 		m[0] = (unsigned char)(ev->mx >> 8);
 		m[1] = (unsigned char)(ev->mx & 0xff);
@@ -367,7 +399,22 @@ handle_host_ev(struct dv_conn *c, struct dv_host *h, struct dv_host_ev *ev,
 		m[4] = (unsigned char)(ev->mcode >> 8);	/* kitty's leave bit is 256 */
 		m[5] = (unsigned char)(ev->mcode & 0xff);
 		m[6] = (unsigned char)ev->mpress;
-		dv_conn_send(c, DV_MSG_MOUSE, m, 7);
+		if (!ev->mpix) {
+			dv_conn_send(c, DV_MSG_MOUSE, m, 7);
+			break;
+		}
+		/* Trailing pixels are optional. An older server reads the cell. */
+		u = (unsigned)ev->mpx;
+		m[7] = (unsigned char)((u >> 24) & 0xff);
+		m[8] = (unsigned char)((u >> 16) & 0xff);
+		m[9] = (unsigned char)((u >> 8) & 0xff);
+		m[10] = (unsigned char)(u & 0xff);
+		u = (unsigned)ev->mpy;
+		m[11] = (unsigned char)((u >> 24) & 0xff);
+		m[12] = (unsigned char)((u >> 16) & 0xff);
+		m[13] = (unsigned char)((u >> 8) & 0xff);
+		m[14] = (unsigned char)(u & 0xff);
+		dv_conn_send(c, DV_MSG_MOUSE, m, 15);
 		break;
 	}
 	case DV_HEV_PTY:
@@ -396,12 +443,15 @@ connect_or_start(const char *sock_path)
 
 int
 dv_client_run(const char *sock_path, int display, struct dv_size sz,
-    const char *term, char **cmdv)
+    const char *term, char **cmdv, bool local_agent)
 {
 	struct dv_conn	 conn;
 	struct dv_host	 host;
 	int		 fd, rc = 0, pipes[2];
-	struct pollfd	 pf[3];
+	std::vector<pollfd> pf(3);
+    std::unique_ptr<terminal_agent::Client> agent;
+    std::string agent_input;
+    if (display) agent=std::make_unique<terminal_agent::Client>(local_agent);
 	int		 got_reply = 0, got_hello = 0, upgrading = 0;
 	char		 fatal[512] = "";
 
@@ -409,7 +459,7 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 
 	fd = connect_or_start(sock_path);
 	if (fd < 0) {
-		fprintf(stderr, "goblin-view: connect %s: %s\n", sock_path,
+		fprintf(stderr, "odin-seat: connect %s: %s\n", sock_path,
 		    strerror(errno));
 		return (1);
 	}
@@ -419,7 +469,7 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 
 	if (display) {
 		if (set_raw() < 0) {
-			fprintf(stderr, "goblin-view: raw tty: %s\n", strerror(errno));
+			fprintf(stderr, "odin-seat: raw tty: %s\n", strerror(errno));
 			close(fd);
 			return (1);
 		}
@@ -441,7 +491,8 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 		{
 			static const char init[] =
 			    "\033[?1049h\033[H\033[2J"
-			    "\033[?1003h\033[?1006h"	/* any-motion + SGR mouse (hover) */
+			    "\033[?1003h\033[?1006h\033[?1016h"	/* motion; pixels where the host can */
+			    "\033[?1016$p"		/* and say whether that took */
 			    "\033]777;caps;v=1:op=reset\033\\"
 			    "\033]777;goblin-pointer;v=1:op=mode:mode=1\033\\"
 			    "\033[?2004h"		/* bracketed paste (drops arrive wrapped) */
@@ -451,11 +502,11 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 		}
 		on_alt_screen = 1;
 		dv_host_bootstrap(&host, STDIN_FILENO, STDOUT_FILENO, &sz);
-		if (sz.cols < 2 || sz.rows < 2)
+		if (sz.cols == 0 || sz.rows == 0)
 			(void)dv_tty_size(&sz);
-		if (sz.cols < 2)
+		if (sz.cols == 0)
 			sz.cols = 80;
-		if (sz.rows < 2)
+		if (sz.rows == 0)
 			sz.rows = 24;
 	}
 
@@ -474,13 +525,15 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 	send_identify(&conn, display, sz, term,
 	    display ? (dv_host_features(&host) | (dv_mono ? DV_IDENT_MONO : 0)) : 0,
 	    display ? host.name : "", display ? host.pointer_caps : 0,
-	    display ? host.silkie_blob : "");
+	    display && host.silkie_blob != nullptr ? host.silkie_blob : "");
 	send_command(&conn, cmdv);
 	dv_conn_flush(&conn);
 
 	for (;;) {
 		int	n, i, nfd_stdin = -1, nfd_winch = -1;
 
+		agent_service(&conn,agent.get());
+        pf.resize(3);
 		i = 0;
 		pf[i].fd = fd;
 		pf[i].events = POLLIN;
@@ -500,8 +553,15 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 			}
 		}
 		/* A held ESC has to expire, or Esc never reaches anyone. */
-		n = poll(pf, (nfds_t)i,
-		    display && dv_host_pending(&host) ? DV_ESC_TIMEOUT : -1);
+        pf.resize(i);
+        int timeout = display && dv_host_pending(&host) ? DV_ESC_TIMEOUT : -1;
+        if (agent) {
+            auto fds=agent->pollfds(); pf.insert(pf.end(),fds.begin(),fds.end());
+            int delay=agent->wait_ms();
+            if (delay>=0) timeout=timeout<0 ? delay : std::min(timeout,delay);
+        }
+        if ((size_t)(nfds_t)pf.size()!=pf.size()) dv_fatal("client poll descriptor count overflow");
+		n = poll(pf.data(), (nfds_t)pf.size(), timeout);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -512,7 +572,7 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 			struct dv_host_ev	ev;
 
 			while (dv_host_expire(&host, &ev))
-				handle_host_ev(&conn, &host, &ev, &sz);
+				handle_host_ev(&conn, &host, &ev, &sz, agent.get());
 			dv_conn_flush(&conn);
 			continue;
 		}
@@ -540,7 +600,7 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 
 				dv_host_feed(&host, buf, (size_t)nr);
 				while (dv_host_next(&host, &ev))
-					handle_host_ev(&conn, &host, &ev, &sz);
+					handle_host_ev(&conn, &host, &ev, &sz, agent.get());
 			}
 		}
 		if (pf[0].revents & POLLOUT) {
@@ -587,28 +647,28 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 					    proto < DV_PROTOCOL) {
 						/* An older server that can be replaced in place:
 						 * ask it to become this program, then carry on. */
-						static char	exe[DV_PATH_MAX], real[DV_PATH_MAX];
+						char		*exe = dv_exe_path();
 						char		*up[3];
 
-						if (dv_exe_path(exe, sizeof exe) &&
-						    realpath(exe, real) != NULL) {
+						if (exe != nullptr) {
 							up[0] = const_cast<char *>("upgrade");
-							up[1] = real;
+							up[1] = exe;
 							up[2] = NULL;
 							send_command(&conn, up);
+							free(exe);
 							upgrading = 1;
 							dv_log("server is protocol %u; upgrading it", proto);
 						}
 					}
 					if (proto != DV_PROTOCOL && !upgrading) {
 						snprintf(fatal, sizeof fatal,
-						    "goblin-view: the server at %s is goblin-view %s "
-						    "(protocol %u); this is goblin-view %s (protocol %u).\n%s",
+						    "odin-seat: the server at %s is odin-seat %s "
+						    "(protocol %u); this is odin-seat %s (protocol %u).\n%s",
 						    sock_path, ver, proto, DV_VERSION, (unsigned)DV_PROTOCOL,
 						    proto > DV_PROTOCOL ?
-						    "The server is newer: run the newer goblin-view instead." :
+						    "The server is newer: run the newer odin-seat instead." :
 						    "Its windows keep running. To use this version, "
-						    "close them, run `goblin-view kill-server`, and "
+						    "close them, run `odin-seat kill-server`, and "
 						    "start again.");
 						if (display) {
 							rc = 1;
@@ -623,10 +683,10 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 						/* A server too old to introduce itself would
 						 * ignore every key we type. Say so, don't. */
 						snprintf(fatal, sizeof fatal,
-						    "goblin-view: the server at %s is an older "
-						    "goblin-view that does not speak protocol %u; typed "
+						    "odin-seat: the server at %s is an older "
+						    "odin-seat that does not speak protocol %u; typed "
 						    "keys would be lost.\nIts windows keep running. To "
-						    "use this version, close them, run `goblin-view "
+						    "use this version, close them, run `odin-seat "
 						    "kill-server`, and start again.", sock_path,
 						    (unsigned)DV_PROTOCOL);
 						rc = 1;
@@ -634,6 +694,12 @@ dv_client_run(const char *sock_path, int display, struct dv_size sz,
 						goto out;
 					}
 					tty_write(STDOUT_FILENO, pl, plen);
+                } else if ((type==DV_MSG_AGENT_PART || type==DV_MSG_AGENT_END) && agent) {
+                    if (plen) agent_input.append((const char *)pl,plen);
+                    if (type==DV_MSG_AGENT_END) {
+                        if (!agent_input.empty()) agent->from_remote(agent_input); agent_input.clear();
+                        agent_service(&conn,agent.get());
+                    }
 				} else if (type == DV_MSG_PASSTHROUGH && plen > 0) {
 					tty_passthrough(STDOUT_FILENO, pl, plen);
 				} else if (type == DV_MSG_REPLY) {
@@ -678,6 +744,7 @@ out:
 	if (fatal[0] != '\0')
 		fprintf(stderr, "%s\n", fatal);
 	dv_buf_free(&host.osc);
+	dv_buf_free(&host.pending);
 	dv_conn_free(&conn);
 	close(fd);
 	if (winch_r >= 0)

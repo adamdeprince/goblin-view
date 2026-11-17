@@ -292,7 +292,7 @@ pretty_path(const char *p, char *out, size_t cap)
 }
 
 /*
- * Where files land: $GOBLIN_VIEW_DOWNLOAD_DIR, else $XDG_DOWNLOAD_DIR,
+ * Where files land: $ODIN_SEAT_DOWNLOAD_DIR, else $XDG_DOWNLOAD_DIR,
  * else the XDG user-dirs file's entry, else ~/Downloads; whichever of
  * those exists, falling back to $HOME.
  */
@@ -313,7 +313,7 @@ download_dir(char *out, size_t cap)
 
 	if (home == nullptr || *home == '\0')
 		home = "/tmp";
-	e = getenv("GOBLIN_VIEW_DOWNLOAD_DIR");
+	e = getenv("ODIN_SEAT_DOWNLOAD_DIR");
 	if (e != nullptr && is_dir(e)) {
 		snprintf(out, cap, "%s", e);
 		return;
@@ -520,7 +520,7 @@ stage_open(struct dv_window *w, struct xf_file *f, const char *dir)
 {
 	static unsigned	seq;
 
-	snprintf(f->tmp, sizeof f->tmp, "%s/.goblin-view.%ld.%u.%u.part", dir,
+	snprintf(f->tmp, sizeof f->tmp, "%s/.odin-seat.%ld.%u.%u.part", dir,
 	    (long)getpid(), w->id, ++seq);
 	f->fd = open(f->tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (f->fd < 0) {

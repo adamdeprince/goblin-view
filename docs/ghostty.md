@@ -1,6 +1,6 @@
 # Ghostty is the host
 
-GoblinView (the `goblin-view` command) runs best **inside Ghostty**: that
+Odin Seat (the `odin-seat` command) runs best **inside Ghostty**: that
 is the environment the input and graphics paths are written for. It runs
 on any terminal, but the graphics features need a host that speaks kitty
 graphics (see **Fallback**).
@@ -12,15 +12,15 @@ layer:
 | --- | --- |
 | menu key = isolated Alt tap | kitty keyboard protocol, flags 11 (disambiguate + events + report-all). Ghostty only emits modifier press/release when report-all is on. |
 | live cell pixels | XTWINOPS `CSI 16 t` (reply `CSI 6 ; ph ; pw t`) and in-band resize mode 2048 (`CSI 48 ; rows ; cols ; height ; width t`) |
-| program resize | a window's program may resize it with XTWINOPS `CSI 8 ; rows ; cols t`; goblin-view caps it to the desktop and shifts it on-screen |
+| program resize | a window's program may resize it with XTWINOPS `CSI 8 ; rows ; cols t`; odin-seat caps it to the desktop and shifts it on-screen |
 | kitty graphics | APC `ESC _ G … ST`, including the query tmux uses (`a=q,t=d,f=24`). A program's sixel is decoded and re-emitted over this too. |
-| text sizing | OSC 66 (`ESC ] 66 ; s=..:w=.. ; text ST`). A window lays the scaled run into its grid and re-emits OSC 66 to the host. |
+| text sizing | OSC 66 (`ESC ] 66 ; s=..:w=..:n=..:d=..:v=..:h=.. ; text ST`). A window lays the scaled run into its grid and re-emits OSC 66 to the host, fractional scale and alignment included. |
 | truecolor / cursor / sync | `xterm-ghostty`, `COLORTERM=truecolor` |
 
 On attach the client pushes those modes onto the host tty and pops them
 on detach (`CSI < u`, `CSI ? 2048 l`).
 
-Child PTYs get `TERM=xterm-ghostty` (override with `GOBLIN_VIEW_TERM`). Inner
+Child PTYs get `TERM=xterm-ghostty` (override with `ODIN_SEAT_TERM`). Inner
 keyboard mode will later follow each window via libghostty-vt; today
 CSI u is decoded and re-encoded to legacy bytes for the PTY.
 
@@ -75,28 +75,36 @@ those; we turn them on from the client.
 Ctrl-\ still opens the menu so `make test` and non-Ghostty attaches can drive
 the menu path. They will not get Alt-tap or cell-pixel reports.
 
-**Graphics adapt to the host; text-only is the floor.** At attach the
+**Graphics adapt to the host; coloured cells are the floor.** At attach the
 client asks the terminal a kitty graphics query with DA1 behind it: a
 kitty reply means kitty graphics, a `4` in the DA1 parameters means
 sixel, and DA1 ends the wait either way. Both bits ride in the identify
 message. The server keeps a per-session flag: graphics are live when any
-attached client can show an image by *either* protocol, and then windows
+attached client can show an image by *either* protocol, or can be drawn
+one as cells (any client that is not strictly black and white, unless
+`cell-pictures = no`), and then windows
 advertise both kitty graphics (answer `a=q`) and sixel (the `4` in DA1,
 plus `XTSMGRAPHICS`) to their programs, because we convert to whatever
 each client's host speaks:
 
-| child draws | host speaks | goblin-view emits |
+| child draws | host speaks | odin-seat emits |
 | --- | --- | --- |
-| kitty | kitty | kitty (Unicode-placeholder placements) |
+| kitty | kitty | kitty (Unicode-placeholder placements; real placements, cut to the visible cells, for a layered window, scaled to its cell when another terminal's is larger) |
 | kitty | sixel | sixel, rasterised at the cell grid |
 | sixel | kitty | kitty (sixel decoded to RGBA) |
 | sixel | sixel | sixel (decoded and re-emitted) |
+| a vector scene (`f=200`) | kitty without vectors, or sixel | the scene drawn by `src/vector/` as pixels, then as above |
+| anything | neither | coloured half-block cells, one pixel by two to the cell (`cell-pictures`) |
 
 Incoming pixels arrive by any kitty medium -- direct, file, temp file, or
 POSIX shared memory -- all accepted at the window endpoint. Outgoing, the
-medium goblin-view hands the host is `GOBLIN_VIEW_KITTY_MEDIUM` (`shm`
+medium odin-seat hands the host is `ODIN_SEAT_KITTY_MEDIUM` (`shm`
 default, or `tempfile`/`file`/`direct`); shm keeps large images out of the
-escape stream, and `direct` is the safe choice across a remote link.
+escape stream, and `direct` is the safe choice across a remote link. An
+image handed over in shared memory or a file goes with `S`, the bytes that
+are its data: a shared memory object is as large as the pages that hold
+it, and a vector scene, which is text to its end, is refused by a terminal
+that reads the padding after it as more records.
 
 A program's kitty image is usually PNG, so kitty-to-sixel needs a PNG
 decoder; `src/png.cc` is an original one (zlib does the inflate) for the

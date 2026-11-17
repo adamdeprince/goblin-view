@@ -1,17 +1,17 @@
-Source: goblin-view
+Source: odin-seat
 Section: utils
 Priority: optional
 Maintainer: Adam DePrince <adam.deprince@gmail.com>
-Build-Depends: debhelper-compat (= 13), zlib1g-dev, python3 <!nocheck>
+Build-Depends: debhelper-compat (= 13), zlib1g-dev, libharfbuzz-dev, pkgconf | pkg-config, python3 <!nocheck>
 Rules-Requires-Root: no
 Standards-Version: 4.6.1
-Homepage: https://apt.goblinreactor.com/
+Homepage: https://xn--hliskjlf-eza0m.goblinreactor.com/
 
-Package: goblin-view
+Package: odin-seat
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: terminal multiplexer with overlapping windows and an Alt-tap menu
- GoblinView keeps a desktop of overlapping terminal windows in a server
+ Odin Seat keeps a desktop of overlapping terminal windows in a server
  process and paints it into the terminal you run it from. Each window is a
  terminal emulator of its own whose state lives in the server, so a session
  survives detaching and every program in it keeps running. A tap of Alt
@@ -21,5 +21,5 @@ Description: terminal multiplexer with overlapping windows and an Alt-tap menu
  keyboard protocol, styled underlines, per-window colours, pointer shapes,
  extra cursors, drag and drop, file transfer, and images by kitty graphics
  or sixel, re-emitted in whatever the terminal you attach from speaks.
- Includes the goblin-view command, manual pages, and input-method
+ Includes the odin-seat command, manual pages, and input-method
  dictionaries (Romaji, US-International, Pinyin, Zhuyin, Wubi).

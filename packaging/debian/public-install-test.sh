@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install goblin-view from the public signed repository in a fresh container
+# Install odin-seat from the public signed repository in a fresh container
 # of each release and exercise it, the way a user would. Run on a podman
 # host after publish.py packages; writes artifacts/<suite>/public-install.log.
 set -eu
@@ -37,25 +37,25 @@ printf "%s\n" "Types: deb deb-src" "URIs: https://apt.goblinreactor.com/" "Suite
     "Signed-By: /etc/apt/keyrings/goblinreactor-archive-keyring.gpg" \
     > /etc/apt/sources.list.d/goblinreactor.sources
 apt-get update -qq
-apt-cache policy goblin-view
-apt-get install -y -qq goblin-view
-goblin-view -V
-dpkg-query -W goblin-view
+apt-cache policy odin-seat
+apt-get install -y -qq odin-seat
+odin-seat -V
+dpkg-query -W odin-seat
 export HOME=/root
 set -x
-goblin-view -L t new-session -s s -d -x 100 -y 30 -- sleep 30
-goblin-view -L t menu o
-test "$(goblin-view -L t list-windows -s s | wc -l)" -eq 2
-goblin-view -L t list-clients >/dev/null
-goblin-view -L t kill-server
+odin-seat -L t new-session -s s -d -x 100 -y 30 -- sleep 30
+odin-seat -L t menu o
+test "$(odin-seat -L t list-windows -s s | wc -l)" -eq 2
+odin-seat -L t list-clients >/dev/null
+odin-seat -L t kill-server
 # What the package ships (a minimized image may exclude /usr/share/man).
-dpkg -L goblin-view | grep -q "^/usr/share/man/man1/goblin-view.1.gz$"
-dpkg -L goblin-view | grep -q "^/usr/share/man/man7/goblin-view-protocols.7.gz$"
-test -f /usr/share/goblin-view/pinyin.dict
-test -f /usr/share/goblin-view/wubi.dict
+dpkg -L odin-seat | grep -q "^/usr/share/man/man1/odin-seat.1.gz$"
+dpkg -L odin-seat | grep -q "^/usr/share/man/man7/odin-seat-protocols.7.gz$"
+test -f /usr/share/odin-seat/pinyin.dict
+test -f /usr/share/odin-seat/wubi.dict
 apt-get install -y -qq dpkg-dev >/dev/null
-mkdir /src && cd /src && apt-get source -qq goblin-view
-test -d /src/goblin-view-*/debian
+mkdir /src && cd /src && apt-get source -qq odin-seat
+test -d /src/odin-seat-*/debian
 echo "PASS: public signed APT install and smoke test: $VERSION_CODENAME $(dpkg --print-architecture)"
 ' > "$log" 2>&1 || { echo "FAILED $suite"; tail -30 "$log"; exit 1; }
     tail -1 "$log"

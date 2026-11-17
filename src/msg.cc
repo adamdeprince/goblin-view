@@ -74,6 +74,22 @@ dv_conn_send(struct dv_conn *c, int type, const void *payload, size_t len)
 	return (dv_msg_pack(&c->out, type, payload, len));
 }
 
+/* A byte stream for the terminal may be split anywhere, so its length is
+ * bound by nothing but memory. */
+void
+dv_conn_send_stream(struct dv_conn *c, int type, const void *payload, size_t len)
+{
+	const char	*p = (const char *)payload;
+
+	while (len > 0) {
+		size_t	n = len > DV_MAX_MSG ? DV_MAX_MSG : len;
+
+		dv_msg_pack(&c->out, type, p, n);
+		p += n;
+		len -= n;
+	}
+}
+
 int
 dv_conn_read(struct dv_conn *c)
 {
@@ -109,4 +125,15 @@ dv_conn_flush(struct dv_conn *c)
 		dv_buf_consume(&c->out, (size_t)n);
 	}
 	return (1);
+}
+
+// A complete agent frame may exceed one IPC message (base64 expands the SSH
+// uint32 packet). Reassemble before dispatch; chunk size is not a frame limit.
+void dv_conn_send_agent(struct dv_conn *c, const void *payload, size_t len) {
+    const char *data=static_cast<const char *>(payload);
+    while (len>DV_MAX_MSG) {
+        if (dv_conn_send(c,DV_MSG_AGENT_PART,data,DV_MAX_MSG)<0) dv_fatal("agent IPC fragment failed");
+        data+=DV_MAX_MSG; len-=DV_MAX_MSG;
+    }
+    if (dv_conn_send(c,DV_MSG_AGENT_END,data,len)<0) dv_fatal("agent IPC frame failed");
 }

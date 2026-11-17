@@ -1,5 +1,5 @@
 #!/usr/bin/make -f
-# goblin-view: a plain Makefile with PREFIX/DESTDIR; dh does the rest.
+# odin-seat: a plain Makefile with PREFIX/DESTDIR; dh does the rest.
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 include /usr/share/dpkg/buildflags.mk
 export CXXFLAGS += -std=c++23
@@ -9,12 +9,12 @@ export CPPFLAGS += -Isrc
 	dh $@
 
 override_dh_auto_build:
-	$(MAKE) CXX=g++ CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' goblin-view
+	$(MAKE) CXX=g++ CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' all
 
 # The install target recompiles with the data directory baked in.
 override_dh_auto_install:
 	$(MAKE) install CXX=g++ CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' \
-	    PREFIX=/usr DESTDIR=$(CURDIR)/debian/goblin-view
+	    PREFIX=/usr DESTDIR=$(CURDIR)/debian/odin-seat
 
 # Unit tests, the socket-level skeleton, and the end-to-end pty tests;
 # not tools/track-tmux, which needs a checkout that only exists upstream.

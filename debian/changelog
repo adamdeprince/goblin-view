@@ -1,4 +1,32 @@
-goblin-view (0.1.0) stable; urgency=medium
+odin-seat (0.1.0+20261117.1) stable; urgency=medium
+
+  * Program status (OSC 7501): records kept per window, shown as a badge in
+    the window frame and the switch list, and exported to a terminal that
+    answers the feature query as w<id>/<id> with a session root record.
+  * ConEmu's OSC 9 sub-commands (title, progress, working directory, prompt
+    marks); OSC 9;4 progress is program status, not a notification. OSC 7
+    working directories; new splits start there.
+  * Silkie deep colours (SGR 38:0, 48:0, 58:0), the caps sgr field, the
+    display output fields and an unbounded colour stack.
+  * Silkie's renumbered packed formats, kitty indexed colour (f=8, f=16),
+    palette images (f=401-408) and palette updates, high precision images
+    (f=316, 632, 664) and the transfer function key, graphics feature
+    queries, 64-bit S and O, and no image size limits.
+
+ -- Adam DePrince <adam.deprince@gmail.com>  Tue, 17 Nov 2026 07:52:00 +0000
+
+odin-seat (0.1.0+20261116.2) stable; urgency=medium
+
+  * Rename GoblinView to Odin Seat (binary, manuals, packages, data dir).
+  * Forward SSH agents over the terminal channel (`odin-seat -A attach`).
+  * Route desktop notifications (OSC 9, 99, 777) to the attached terminal
+    and their answers back to the program.
+  * Silkie ink, fonts and vector scenes end to end; window splitting and
+    tiny-window resizes; a frame-paced event loop; relocatable paths.
+
+ -- Adam DePrince <adam.deprince@gmail.com>  Tue, 17 Nov 2026 00:30:00 +0000
+
+odin-seat (0.1.0) stable; urgency=medium
 
   * First packaged release: overlapping windows, the Alt-tap menu, the
     mouse, detach and reattach, kitty and sixel images re-emitted for the

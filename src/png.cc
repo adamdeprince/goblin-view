@@ -74,7 +74,8 @@ dv_png_decode(const unsigned char *d, size_t n, unsigned char **rgba,
 {
 	static const unsigned char sig[8] =
 	    { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
-	unsigned	 w = 0, h = 0, chans, stride, bpp;
+	unsigned	 w = 0, h = 0, chans, bpp;
+	size_t		 stride;
 	int		 bd = 0, ct = -1, interlace = 0, ok = 0;
 	size_t		 i;
 	unsigned char	*idat = nullptr, *filt = nullptr, *out = nullptr;
@@ -118,10 +119,15 @@ dv_png_decode(const unsigned char *d, size_t n, unsigned char **rgba,
 			}
 		} else if (memcmp(type, "IDAT", 4) == 0) {
 			if (idat_len + len > idat_cap) {
+				unsigned char	*ni;
+
 				idat_cap = (idat_len + len) * 2 + 1;
-				idat = (unsigned char *)realloc(idat, idat_cap);
-				if (idat == nullptr)
+				ni = (unsigned char *)realloc(idat, idat_cap);
+				if (ni == nullptr) {
+					free(idat);
 					return (0);
+				}
+				idat = ni;
 			}
 			memcpy(idat + idat_len, cd, len);
 			idat_len += len;
@@ -129,8 +135,10 @@ dv_png_decode(const unsigned char *d, size_t n, unsigned char **rgba,
 			break;
 		i += 12 + (size_t)len;		/* len + type + data + CRC */
 	}
-	if (w == 0 || h == 0 || w > 8192 || h > 8192 || interlace != 0 ||
-	    idat == nullptr) {
+	/* Any size the format allows (2^31 - 1 a side) that memory holds. */
+	if (w == 0 || h == 0 || w > 0x7fffffffu || h > 0x7fffffffu ||
+	    interlace != 0 || idat == nullptr ||
+	    (uint64_t)w * h > (uint64_t)SIZE_MAX / 4 / 2) {
 		free(idat);
 		return (0);
 	}
@@ -150,11 +158,15 @@ dv_png_decode(const unsigned char *d, size_t n, unsigned char **rgba,
 		free(idat);		/* truecolour needs 8 or 16 bits */
 		return (0);
 	}
-	stride = (unsigned)(((size_t)w * chans * bd + 7) / 8);
+	stride = ((size_t)w * chans * (size_t)bd + 7) / 8;
 	bpp = (unsigned)((chans * bd + 7) / 8);
 	if (bpp < 1)
 		bpp = 1;
-	filt_len = (size_t)(stride + 1) * h;
+	if (stride + 1 > SIZE_MAX / h) {
+		free(idat);
+		return (0);
+	}
+	filt_len = (stride + 1) * h;
 	filt = (unsigned char *)malloc(filt_len);
 	out = (unsigned char *)malloc((size_t)w * h * 4);
 	if (filt == nullptr || out == nullptr ||
@@ -167,7 +179,7 @@ dv_png_decode(const unsigned char *d, size_t n, unsigned char **rgba,
 		unsigned char	*cur = row + 1;
 		unsigned char	*prev = y ? filt + (size_t)(y - 1) *
 				    (stride + 1) + 1 : nullptr;
-		unsigned	 k;
+		size_t		 k;
 
 		for (k = 0; k < stride; k++) {
 			int	a = k >= bpp ? cur[k - bpp] : 0;

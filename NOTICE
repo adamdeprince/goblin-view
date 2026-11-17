@@ -1,4 +1,4 @@
-GoblinView
+Odin Seat
 Copyright 2026 Adam DePrince
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -11,3 +11,14 @@ The bundled input-method dictionaries (share/pinyin.dict, share/wubi.dict)
 are generated from third-party data: mozillazg/pinyin-data (MIT License),
 the Unicode Unihan database (Unicode License), and KyleBing/rime-wubi86-jidian
 (Apache License 2.0). See share/README.md for provenance.
+
+The vector rasterizer (src/vector/vector.c, vector.h, vector-color.h) is
+copied from Silkie by its author, Adam DePrince, who holds the copyright in
+it; it is distributed here under the Apache License 2.0. It uses Verstable
+(src/vector/verstable.h), Copyright (c) 2023-2024 Jackson L. Allan, under
+the MIT License, whose text is in that file. See docs/CLEANROOM.md.
+
+Text in those scenes is laid out by src/vtext.cc, whose layout and shaping
+are likewise the author's own from Silkie (kitty/fonts/vector.py and
+kitty/vector-text.h). It links HarfBuzz, which is not distributed with Odin
+Seat and is under its own "Old MIT" licence.

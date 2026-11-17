@@ -1,6 +1,6 @@
 # Tracking `~/dev/tmux`
 
-The host terminal is Ghostty (`docs/ghostty.md`). GoblinView is still a new
+The host terminal is Ghostty (`docs/ghostty.md`). Odin Seat is still a new
 multiplexer, not a tmux fork. Kitty graphics *as a multiplexer* (id remap,
 per-client transmit, crop, query ownership) is taken from Adam's tmux tree
 (`github.com:adamdeprince/tmux.git`, branch `kitty-graphics`) and must be
@@ -45,7 +45,7 @@ The pin lives in `docs/tmux-tracking.manifest`. Last synced commit:
   reply to **our** graphics query; other `ESC _ G` replies belong to the
   pane (passthrough).
 - Chunk payload at 4096. The tracked tmux implementation limits storage to
-  16 MiB / image, 32 MiB total, and 64 images; goblin-view dynamically allocates
+  16 MiB / image, 32 MiB total, and 64 images; odin-seat dynamically allocates
   image storage without fixed image-count or memory budgets.
 - Direct placements: `a=p,C=1` with source crop when partially visible.
 - Virtual placements (`U=1`) are re-emitted whenever the image is
@@ -58,16 +58,16 @@ The pin lives in `docs/tmux-tracking.manifest`. Last synced commit:
 
 ## Where ports live
 
-Ported C goes in `src/tmuxport/` only. GoblinView window ids, the overlapping
+Ported C goes in `src/tmuxport/` only. Odin Seat window ids, the overlapping
 compositor, and menus must not be mixed into those files. Glue is
 `src/kitty.c` (when it exists).
 
 A re-sync is: `tools/track-tmux` → port the delta into `src/tmuxport/` →
 extend regress → `tools/track-tmux pin`.
 
-## Overlap (GoblinView, not tmux)
+## Overlap (Odin Seat, not tmux)
 
 tmux floating panes still live on a tiled spine. Kitty images paint **above**
 cells in the host terminal, so covering a cell with a space does not hide an
-image. GoblinView must clip placements by z-order (crop or delete) when another
+image. Odin Seat must clip placements by z-order (crop or delete) when another
 window occludes them. That logic stays outside `src/tmuxport/`.

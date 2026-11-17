@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Render Formula/goblin-view.rb from goblin-view.rb.in.
+"""Render Formula/odin-seat.rb from odin-seat.rb.in.
 
-    render-formula.py goblin-view-<version>.tar.gz [bottle.json]
+    render-formula.py odin-seat-<version>.tar.gz [bottle.json]
 
 The archive's SHA-256 and version fill the template; a bottle JSON file
 (from `brew bottle --json`) adds the bottle block with its tag and checksum.
@@ -13,7 +13,7 @@ import re
 import sys
 
 archive = pathlib.Path(sys.argv[1])
-version = re.fullmatch(r'goblin-view-(.+)\.tar\.gz', archive.name).group(1)
+version = re.fullmatch(r'odin-seat-(.+)\.tar\.gz', archive.name).group(1)
 sha = hashlib.sha256(archive.read_bytes()).hexdigest()
 block = ''
 if len(sys.argv) > 2:
@@ -29,7 +29,7 @@ if len(sys.argv) > 2:
         lines.append(f'    sha256 cellar: {cellar_rb}, {tag}: "{t["sha256"]}"')
     lines.append('  end')
     block = '\n'.join(lines) + '\n\n'
-template = (pathlib.Path(__file__).parent / 'goblin-view.rb.in').read_text()
+template = (pathlib.Path(__file__).parent / 'odin-seat.rb.in').read_text()
 out = template.replace('@VERSION@', version).replace('@SOURCE_SHA256@', sha)
 out = out.replace('@BOTTLE_BLOCK@\n', block)
 sys.stdout.write(out)

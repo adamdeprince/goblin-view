@@ -1,7 +1,7 @@
 #!/bin/sh
-# Build goblin-view packages for every supported Debian and Ubuntu release
+# Build odin-seat packages for every supported Debian and Ubuntu release
 # in disposable podman containers. Run on a Linux host with podman, from a
-# directory holding snapshot.tar.gz (one goblin-view/ tree inside), this
+# directory holding snapshot.tar.gz (one odin-seat/ tree inside), this
 # script, build-release.sh and Containerfile. Arguments: the base version
 # (e.g. 0.1.0+20260910.1) and the suites to build (default: all).
 set -eu
@@ -28,8 +28,8 @@ for suite in $suites; do
     podman image inspect --format '{{.Digest}}' "$img" > "$out/base-image-digest.txt"
     echo "$img" >> "$out/base-image-digest.txt"
     podman build -q --build-arg BASE_IMAGE="$img" -f Containerfile \
-        -t "goblin-view-build:$suite" . >/dev/null
-    podman run --rm -v "$out:/out:Z" "goblin-view-build:$suite" \
+        -t "odin-seat-build:$suite" . >/dev/null
+    podman run --rm -v "$out:/out:Z" "odin-seat-build:$suite" \
         "$suite" "$version" > "$out/build.log" 2>&1 || {
         echo "FAILED $suite (see $out/build.log)"; tail -40 "$out/build.log"; exit 1; }
     echo "built $suite: $(ls "$out"/*.deb)"

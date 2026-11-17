@@ -18,7 +18,7 @@ dv_log(const char *fmt, ...)
 	if (!dv_verbose)
 		return;
 	clock_gettime(CLOCK_REALTIME, &ts);
-	fprintf(stderr, "goblin-view %lld.%03ld: ",
+	fprintf(stderr, "odin-seat %lld.%03ld: ",
 	    (long long)ts.tv_sec, ts.tv_nsec / 1000000L);
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
@@ -31,7 +31,7 @@ dv_fatal(const char *fmt, ...)
 {
 	va_list	ap;
 
-	fprintf(stderr, "goblin-view: ");
+	fprintf(stderr, "odin-seat: ");
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);

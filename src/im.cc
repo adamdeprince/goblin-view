@@ -19,6 +19,8 @@
 
 #include "dv.hpp"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,64 +151,99 @@ im_get(struct immap *m, const char *key)
 	return (nullptr);
 }
 
-/* This executable's path, as the OS knows it. */
-int
-dv_exe_path(char *out, size_t cap)
+/* Resolve without imposing a path limit below the operating system's own. */
+char *
+dv_exe_path(void)
 {
+	char	*path, *resolved;
+
 #ifdef __APPLE__
-	uint32_t	sz = (uint32_t)cap;
+	/* _NSGetExecutablePath reports its required allocation as uint32_t. */
+	uint32_t	sz = 0;
 
-	return (_NSGetExecutablePath(out, &sz) == 0);
+	(void)_NSGetExecutablePath(nullptr, &sz);
+	if (sz == 0)
+		return (nullptr);
+	path = static_cast<char *>(xmalloc(sz));
+	while (_NSGetExecutablePath(path, &sz) != 0)
+		path = static_cast<char *>(xrealloc(path, sz));
 #else
-	ssize_t	n = readlink("/proc/self/exe", out, cap - 1);
+	size_t	cap = 128;
 
-	if (n <= 0)
-		return (0);
-	out[n] = '\0';
-	return (1);
+	path = static_cast<char *>(xmalloc(cap));
+	for (;;) {
+		ssize_t	n = readlink("/proc/self/exe", path, cap - 1);
+
+		if (n <= 0) {
+			free(path);
+			return (nullptr);
+		}
+		if (static_cast<size_t>(n) < cap - 1) {
+			path[n] = '\0';
+			break;
+		}
+		/* readlink returns a signed byte count. */
+		if (cap > static_cast<size_t>(SSIZE_MAX) / 2)
+			dv_fatal("executable path allocation overflow");
+		cap *= 2;
+		path = static_cast<char *>(xrealloc(path, cap));
+	}
 #endif
+	resolved = realpath(path, nullptr);
+	if (resolved == nullptr && errno == ENOMEM)
+		dv_fatal("realpath: %s", strerror(errno));
+	free(path);
+	return (resolved);
 }
 
 /*
- * Where the dictionaries are: $GOBLIN_VIEW_IMDATA if set; else the
- * share/goblin-view beside this executable's bin directory, so a relocated
+ * Where the dictionaries are: $ODIN_SEAT_IMDATA if set; else the
+ * share/odin-seat beside this executable's bin directory, so a relocated
  * installation (a Homebrew bottle poured into another prefix, a tree
  * copied elsewhere) still finds them; else the directory compiled in.
  */
 const char *
 dv_im_datadir(void)
 {
-	static char	 resolved[1024];
-	const char	*e = getenv("GOBLIN_VIEW_IMDATA");
-	char		 exe[1024], real[1024];
-#ifdef GOBLIN_VIEW_DATADIR
-	const char	*compiled = GOBLIN_VIEW_DATADIR;
+	static char	*resolved;
+	const char	*e = getenv("ODIN_SEAT_IMDATA");
+	char		*real;
+#ifdef ODIN_SEAT_DATADIR
+	const char	*compiled = ODIN_SEAT_DATADIR;
 #else
 	const char	*compiled = "share";
 #endif
 
 	if (e != nullptr && e[0] != '\0')
 		return (e);
-	if (resolved[0] != '\0')
+	if (resolved != nullptr)
 		return (resolved);
-	if (dv_exe_path(exe, sizeof exe) && realpath(exe, real) != nullptr) {
+	if ((real = dv_exe_path()) != nullptr) {
 		char	*slash = strrchr(real, '/');
 
 		if (slash != nullptr) {
-			char	probe[1100];
+			char	*probe;
 
 			*slash = '\0';		/* .../bin */
-			snprintf(resolved, sizeof resolved, "%s/../share/goblin-view", real);
-			snprintf(probe, sizeof probe, "%s/pinyin.dict", resolved);
-			if (access(probe, R_OK) == 0)
+			resolved = xasprintf("%s/../share/odin-seat", real);
+			probe = xasprintf("%s/pinyin.dict", resolved);
+			int found = access(probe, R_OK) == 0;
+			free(probe);
+			if (found) {
+				free(real);
 				return (resolved);
+			}
+			free(resolved);
+			resolved = nullptr;
 			if (compiled[0] != '/') {	/* a relative fallback: from bin/ */
-				snprintf(resolved, sizeof resolved, "%s/%s", real, compiled);
+				resolved = xasprintf("%s/%s", real, compiled);
+				free(real);
 				return (resolved);
 			}
 		}
+		free(real);
 	}
-	dv_strlcpy(resolved, compiled, sizeof resolved);
+	resolved = xstrdup(compiled);
 	return (resolved);
 }
 
@@ -219,7 +256,7 @@ im_datadir(void)
 static void
 im_load(struct immap *m, const char *name, size_t cap)
 {
-	char	 path[1024];
+	char	*path;
 	FILE	*f;
 	char	*line = nullptr;
 	size_t	 linecap = 0;
@@ -228,8 +265,9 @@ im_load(struct immap *m, const char *name, size_t cap)
 	if (m->loaded != 0)
 		return;
 	m->loaded = -1;
-	snprintf(path, sizeof path, "%s/%s", im_datadir(), name);
+	path = xasprintf("%s/%s", im_datadir(), name);
 	f = fopen(path, "r");
+	free(path);
 	if (f == nullptr)
 		return;
 	m->cap = cap;

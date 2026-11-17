@@ -24,6 +24,11 @@ int main(){
     assert(gp::window_coordinate(50*256,0,10,0,10,10)==-50*256);
     assert(gp::window_coordinate(50*256,2,3,0,10,20)==80*256);
     assert(gp::cell_at(-1,10)==-1 && gp::cell_at(-2560,10)==-1 && gp::cell_at(-2561,10)==-2);
+    assert(gp::sgr_pixel(1, -1, 10, 10, 5) == 5);
+    assert(gp::sgr_pixel(1, 0, 10, 10, 5) == 1);
+    assert(gp::sgr_pixel(5, 0, 10, 10, 20) == 41);
+    assert(gp::sgr_pixel(5, 9, 10, 10, 20) == 50);
+    assert(gp::sgr_pixel(1, 123, 256, 10, 5) == 5);
     send(w,gp::mode(true));send(w,"\033c");assert(!w->screen.pointer_mode);
     dv_screen_free(&w->screen);dv_buf_free(&w->pty_out);dv_buf_free(&w->cap);free(w);free(session);
     std::cout<<"Per-window pointer negotiation, reset/cancellation and coordinate transforms passed.\n";

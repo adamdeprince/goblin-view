@@ -3,31 +3,14 @@
  */
 
 #include "dv.hpp"
+#include "pstatus.hpp"
+#include "agent.hpp"
 #include "silkie.hpp"
 
+#include <algorithm>
+#include <limits.h>
 #include <string.h>
 #include <unistd.h>
-
-static unsigned
-next_window_id(struct dv_desktop *d)
-{
-	unsigned	id;
-	struct dv_window *w;
-	int		used;
-
-	for (id = 1; id < 256; id++) {
-		used = 0;
-		TAILQ_FOREACH(w, &d->windows, entry) {
-			if (w->id == id) {
-				used = 1;
-				break;
-			}
-		}
-		if (!used)
-			return (id);
-	}
-	return (0);
-}
 
 static int
 max_z(struct dv_desktop *d)
@@ -78,7 +61,7 @@ void
 dv_window_banner(struct dv_window *w)
 {
 	static const char	*lines[] = {
-	    "\033[1;36m goblin-view " DV_VERSION "\033[0m  GoblinView: overlapping windows.\r\n",
+	    "\033[1;36m Odin Seat " DV_VERSION "\033[0m  Overlapping terminal windows.\r\n",
 	    " The \033[1;33mmenu key\033[0m is a tap of \033[1;33mAlt\033[0m"
 	    " (Option on a Mac): press, let go. Or press \033[1;33mCtrl-\\\033[0m.\r\n",
 	    " Menu: \033[1;33mO\033[0mpen \033[1;33mC\033[0mlose"
@@ -89,9 +72,9 @@ dv_window_banner(struct dv_window *w)
 	    " \033[1;33mR\033[0m, arrows (Shift=5), Enter. Or drag the frame"
 	    " with the mouse.\r\n",
 	    " Ghostty: set \033[1;33mmacos-option-as-alt = true\033[0m in"
-	    " ~/.config/ghostty/config so the Option tap reaches goblin-view.\r\n",
+	    " ~/.config/ghostty/config so the Option tap reaches odin-seat.\r\n",
 	    " Windows overlap and stay live when you detach.  Reattach with"
-	    " \033[1;33mgv\033[0m.\r\n\r\n",
+	    " \033[1;33modin-seat\033[0m.\r\n\r\n",
 	};
 	unsigned	i;
 
@@ -126,7 +109,7 @@ void
 dv_window_resize_to(struct dv_window *w, unsigned cols, unsigned rows)
 {
 	struct dv_desktop	*d = &w->session->desktop;
-	int			 framed = w->framed && !w->zoomed;
+	int			 framed = dv_window_framed(w);
 	unsigned		 cc = framed ? 2u : 0u, cr = framed ? 2u : 0u;
 
 	if (w->zoomed || w->hidden || w->aside)
@@ -145,7 +128,26 @@ dv_window_resize_to(struct dv_window *w, unsigned cols, unsigned rows)
 void
 dv_window_raise(struct dv_window *w)
 {
-	w->z = max_z(&w->session->desktop) + 1;
+	struct dv_desktop *d = &w->session->desktop;
+	int top = max_z(d);
+
+	if (top == INT_MAX) {
+		std::vector<dv_window *> windows;
+		struct dv_window *it;
+
+		TAILQ_FOREACH(it, &d->windows, entry)
+			windows.push_back(it);
+		if (windows.size() >= INT_MAX)
+			dv_fatal("window stacking order exhausted");
+		std::sort(windows.begin(), windows.end(), [](const auto *a, const auto *b) {
+			return (a->z < b->z);
+		});
+		int z = 0;
+		for (auto *window : windows)
+			window->z = z++;
+		top = z - 1;
+	}
+	w->z = top + 1;
 }
 
 void
@@ -191,7 +193,7 @@ dv_window_open(struct dv_session *s, const char *cmd, char *const *cmd_argv,
 	unsigned		 id;
 	int			 first;
 
-	id = next_window_id(d);
+	id = dv_desktop_next_window_id(d);
 	if (id == 0)
 		return (NULL);
 
@@ -241,7 +243,8 @@ dv_window_open(struct dv_session *s, const char *cmd, char *const *cmd_argv,
 
 	if (dv_pty_spawn(w, cmd, cmd_argv) != 0) {
 		dv_screen_free(&w->screen);
-		free(w);
+		free(w->notification_pending);
+	free(w);
 		return (NULL);
 	}
 
@@ -250,6 +253,42 @@ dv_window_open(struct dv_session *s, const char *cmd, char *const *cmd_argv,
 	if (first)
 		dv_window_banner(w);
 	return (w);
+}
+
+struct dv_window *
+dv_window_split(struct dv_window *w, int below, char *const *cmd_argv,
+    const char *cwd)
+{
+	struct dv_session *s = w->session;
+	struct dv_geom original = w->geom, first, second;
+	struct dv_window *created;
+	int framed = dv_frame_fits(s->desktop.cols, s->desktop.rows);
+
+	/* A zoomed window divides the full desktop into two framed windows. */
+	if (w->zoomed) {
+		unsigned chrome = framed ? 2u : 0u;
+
+		original.cols -= chrome;
+		original.rows -= chrome;
+	}
+	if (!dv_split_geom(&original, framed, below, &first, &second))
+		return (nullptr);
+	/* Spawn first: an exhausted PTY or failed fork leaves the original
+	 * window's geometry and zoom state unchanged. */
+	created = dv_window_open(s, nullptr, cmd_argv, 0,
+	    cwd != nullptr && cwd[0] != '\0' ? cwd : w->cwd);
+	if (created == nullptr)
+		return (nullptr);
+	dv_pointer_cancel(w);
+	dv_silkie_cancel_window(w);
+	w->zoomed = 0;
+	w->framed = created->framed = 1;
+	w->geom = w->saved = first;
+	created->geom = created->saved = second;
+	dv_window_set_pty_size(w);
+	dv_window_set_pty_size(created);
+	s->dirty = 1;
+	return (created);
 }
 
 /* A window taken over from a previous server: its pty and program are
@@ -276,6 +315,7 @@ dv_window_adopt(struct dv_session *s, unsigned id, int pty_fd, pid_t pid,
 void
 dv_window_close(struct dv_window *w)
 {
+	dv_agent_window_closed(w);
 	struct dv_desktop	*d = &w->session->desktop;
 	struct dv_window	*next;
 
@@ -287,7 +327,10 @@ dv_window_close(struct dv_window *w)
 	 * that lands on the window now focused, closing it too.
 	 */
 	w->session->dirty = 1;
+	if (w->session->kill_confirm == w->id)
+		w->session->kill_confirm = 0;
 	dv_silkie_reset_pane(w);	/* pty is still open; cancel reaches the program */
+	dv_pstatus_close(w);		/* and its status leaves the terminals */
 	{
 		unsigned	k;
 
@@ -304,6 +347,8 @@ dv_window_close(struct dv_window *w)
 	dv_screen_free(&w->screen);
 	dv_buf_free(&w->cap);
 	dv_kitty_free(w);
+	dv_kitty_close(w);
+	dv_silkie_free_window(w);
 	dv_buf_free(&w->host_out);
 	TAILQ_REMOVE(&d->windows, w, entry);
 	if (d->focused == w) {
@@ -315,7 +360,9 @@ dv_window_close(struct dv_window *w)
 		d->focused = next;
 		if (next != nullptr)
 			dv_window_raise(next);
+		dv_window_report_focus(next);
 		dv_silkie_push(w->session);
 	}
+	free(w->notification_pending);
 	free(w);
 }

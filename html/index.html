@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Odin Seat is a DESQview-inspired terminal multiplexer. Overlapping windows, persistent sessions, Kitty graphics and Silkie terminal extensions.">
+  <meta name="theme-color" content="#11130f">
+  <link rel="canonical" href="https://xn--hliskjlf-eza0m.goblinreactor.com/">
+  <meta property="og:url" content="https://xn--hliskjlf-eza0m.goblinreactor.com/">
+  <meta property="og:title" content="Odin Seat — a whole desktop in your terminal">
+  <meta property="og:description" content="Move your windows. Keep your sessions. Bring your graphics. A DESQview-inspired terminal multiplexer for modern terminals.">
+  <meta property="og:image" content="https://xn--hliskjlf-eza0m.goblinreactor.com/goblin.png">
+  <link rel="icon" href="goblin.png" type="image/png">
+  <link rel="apple-touch-icon" href="goblin.png">
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+  <title>Odin Seat — a whole desktop in your terminal</title>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header" id="top">
+    <nav class="container nav-inner" aria-label="Main navigation">
+      <a class="brand" href="#top" aria-label="Odin Seat home">
+        <span class="brand-mark"><img src="goblin.png" alt="" width="38" height="38"></span>
+        <span>Odin Seat</span>
+      </a>
+      <div class="nav-links">
+        <a href="#desktop">The desktop</a>
+        <a href="#protocols">Protocols</a>
+        <a href="#compare">Compare</a>
+        <a href="#workflow">How it works</a>
+        <a class="nav-cta" href="#install">Get Odin Seat <span aria-hidden="true">↗</span></a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="container hero-inner">
+        <div class="hero-text">
+          <p class="eyebrow">A whole desktop in your terminal</p>
+          <h1 id="hero-title">Odin Seat<span class="title-dot">.</span></h1>
+          <p class="hero-copy">Overlapping windows. Sessions that keep running. Kitty graphics and Silkie extensions, all in one terminal.</p>
+          <p class="hero-detail">Named for Odin’s high seat: a place to survey your world. The spirit of DESQview, with a modern terminal underneath.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="#install">Install Odin Seat <span aria-hidden="true">↗</span></a>
+            <a class="button secondary" href="#desktop">Explore the desktop <span aria-hidden="true">↓</span></a>
+          </div>
+          <ul class="hero-notes" aria-label="Project details">
+            <li>Apache 2.0</li><li>C++23</li><li>macOS + Linux</li>
+          </ul>
+        </div>
+        <div class="hero-art">
+          <img src="goblin.png" alt="The Odin Seat mascot, a fluffy black-and-white Silkie chicken" width="1254" height="1254" fetchpriority="high">
+          <span class="mascot-note"><span aria-hidden="true">↖</span> your desktop companion</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="feature-strip">
+      <div class="container strip-grid">
+        <div><b>Overlap.</b><span>A place for every window.</span></div>
+        <div><b>Detach.</b><span>Your programs keep running.</span></div>
+        <div><b>Draw.</b><span>Kitty graphics. Sixel. Silkie.</span></div>
+        <div><b>Return.</b><span>Your session is still there.</span></div>
+      </div>
+    </div>
+
+    <section class="section desktop-section" id="desktop" aria-labelledby="desktop-title">
+      <div class="container">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">01 / Your workspace</p>
+            <h2 id="desktop-title">Make room for<br>all your work.</h2>
+          </div>
+          <p class="section-intro">An editor here. A shell there. A picture wherever you need it. Move, resize, raise and overlap windows on a single terminal desktop.</p>
+        </div>
+
+        <figure class="screenshot-figure" id="screenshot">
+          <a class="screenshot-link" href="odin-seat-screenshot.png" aria-label="View the Odin Seat screenshot at full resolution">
+            <img src="odin-seat-screenshot.png" alt="Odin Seat with overlapping windows showing an equation editor, a gnuplot 3D surface plot, Chrome through Goblin Scry, and a shell" width="4112" height="2520" loading="lazy" decoding="async">
+          </a>
+          <figcaption><span>A working Odin Seat desktop: mathematical notation, a gnuplot 3D plot, and Chrome through <code>goblin-scry</code>, alongside a shell. Text and graphics in one overlapping workspace.</span><a href="odin-seat-screenshot.png">View full resolution <span aria-hidden="true">↗</span></a></figcaption>
+        </figure>
+
+        <div class="workspace-details">
+          <article><span class="item-number">01 / Arrange</span><h3>Your windows, your layout.</h3><p>Move, resize, snap and zoom. Split a window to open another program beside or below it, leaving the rest of your desktop in place. Each half stays independently movable.</p></article>
+          <article><span class="item-number">02 / Keep going</span><h3>The server keeps your place.</h3><p>Each window has its own terminal state and scrollback. Detach from the desktop while shells, editors and long-running jobs carry on.</p></article>
+          <article><span class="item-number">03 / Share the session</span><h3>One desktop. More than one view.</h3><p>Attach from multiple terminals. Smaller clients follow the focused window through a viewport; the desktop uses the largest attached size.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section protocol-section" id="protocols" aria-labelledby="protocol-title">
+      <div class="container">
+        <p class="eyebrow">02 / Beyond the character cell</p>
+        <h2 id="protocol-title">A modern terminal<br>all the way through.</h2>
+        <p class="section-intro">Your programs talk to a terminal inside every window. Odin Seat keeps their state separate, translates coordinates and carries supported features through to the terminal you attach from.</p>
+        <div class="protocol-grid">
+          <article>
+            <div class="protocol-index"><span>01</span><span>TEXT + PIXELS</span></div>
+            <h3>Kitty, window by window.</h3>
+            <p>Enhanced keyboard input, inline graphics, styled text, clipboard access and file transfer. Image placements move and clip with their windows.</p>
+            <ul class="protocol-list"><li>Kitty graphics ↔ sixel translation</li><li>Keyboard modes and palettes per window</li><li>OSC 66 text sizing on supporting hosts</li></ul>
+            <a class="text-link" href="https://sw.kovidgoyal.net/kitty/protocol-extensions/">Explore the Kitty protocols <span aria-hidden="true">↗</span></a>
+          </article>
+          <article>
+            <div class="protocol-index"><span>02</span><span>PEN + TOUCH + DISPLAY</span></div>
+            <h3>Silkie comes along.</h3>
+            <p>Capability queries, tablet input, gestures, pixel scrolling, display information and frame feedback. Input follows the window where a contact began.</p>
+            <ul class="protocol-list"><li>Pen and touch coordinates translated</li><li>Deep colour and palette, 16-bit and HDR10 images</li><li>Capabilities negotiated with attached hosts</li></ul>
+            <a class="text-link" href="https://silkie.goblinreactor.com/protocols/">Read the Silkie specifications <span aria-hidden="true">↗</span></a>
+          </article>
+        </div>
+        <div class="compatibility-note"><span class="compatibility-label">MEET YOUR TERMINAL WHERE IT IS</span><p>Use a terminal that supports the features you need. Kitty and sixel images are emitted in the host’s format; text-only clients omit images. Silkie extensions are offered when an attached host advertises them. A monochrome mode supports e-paper displays.</p></div>
+      </div>
+    </section>
+
+    <section class="section comparison-section" id="compare" aria-labelledby="compare-title">
+      <div class="container">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">03 / Compare multiplexers</p>
+            <h2 id="compare-title">Keep the features<br>you came for.</h2>
+          </div>
+          <p class="section-intro">A persistent workspace carries more than text. Compare window management, what programs can tell you, Kitty terminal extensions and Silkie support across Odin Seat, tmux, GNU Screen and Zellij.</p>
+        </div>
+
+        <p class="comparison-hint" id="comparison-hint">On smaller screens, scroll the table sideways to compare all four.</p>
+        <div class="comparison-scroll" role="region" aria-labelledby="compare-title" aria-describedby="comparison-hint comparison-notes" tabindex="0">
+          <table class="feature-matrix">
+            <caption>Terminal multiplexer feature matrix <span>Documentation reviewed <time datetime="2026-11-17">November 17, 2026</time></span></caption>
+            <colgroup><col class="matrix-feature"><col class="matrix-odin"><col><col><col></colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Feature</th>
+                <th scope="col" class="matrix-spotlight">Odin Seat <span>Kitty + Silkie, per window</span></th>
+                <th scope="col"><a href="https://raw.githubusercontent.com/tmux/tmux/3.8/tmux.1">tmux <span>3.8 manual ↗</span></a></th>
+                <th scope="col"><a href="https://www.gnu.org/software/screen/manual/screen.html">GNU Screen <span>Upstream manual ↗</span></a></th>
+                <th scope="col"><a href="https://zellij.dev/documentation/compatibility.html">Zellij <span>Current documentation ↗</span></a></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="matrix-group"><th colspan="5" scope="rowgroup">The workspace</th></tr>
+              <tr>
+                <th scope="row">Detach and reattach<span>Keep programs running between visits</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong></td><td><strong>Yes</strong></td><td><strong>Yes</strong></td><td><strong>Yes</strong></td>
+              </tr>
+              <tr>
+                <th scope="row">Window arrangement</th>
+                <td class="matrix-spotlight"><strong>Overlapping desktop</strong><span>Move, resize, raise, split, snap and zoom</span></td>
+                <td>Tiled + floating panes</td><td>Split regions</td><td>Tiled, floating + stacked panes</td>
+              </tr>
+            </tbody>
+            <tbody>
+              <tr class="matrix-group"><th colspan="5" scope="rowgroup">What your programs tell you</th></tr>
+              <tr>
+                <th scope="row">Desktop notifications<span>OSC 9, OSC 99 and OSC 777</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Sent to the host; a click returns to the window</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong><span>Sent to the host as OSC 99 or OSC 9</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Program status<span>OSC 7501: working, blocked, done, failed</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Badge in each window’s frame; every window’s records sent to the host</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong><span>Session status sent to the host</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Progress bars<span>ConEmu OSC 9;4</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Shown as the window’s program status</span></td>
+                <td><strong>Yes</strong><span>Per pane; sent to hosts that support it</span></td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Working directory<span>OSC 7 and ConEmu OSC 9;9</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>New splits open where the program is</span></td>
+                <td><strong>Yes</strong><span>OSC 7, per pane; sent to hosts that support it</span></td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong><span>Focused pane’s directory sent to the host</span></td>
+              </tr>
+            </tbody>
+            <tbody>
+              <tr class="matrix-group"><th colspan="5" scope="rowgroup">Kitty and terminal capabilities</th></tr>
+              <tr>
+                <th scope="row">Kitty keyboard protocol<span>Enhanced key reporting and application modes</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Flags and mode stacks per window</span></td>
+                <td>Extended keys<span>CSI u / xterm formats</span></td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong><span>Host-dependent option</span></td>
+              </tr>
+              <tr>
+                <th scope="row">System clipboard<span>OSC 52 copy and read</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Host relay; replies routed to the window</span></td>
+                <td><strong>Yes</strong><span>Configurable copy and read</span></td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong><span>Reading is opt-in</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Kitty rich clipboard<span>OSC 5522</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Host relay</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Kitty file transfer<span>OSC 5113, in both directions</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Host relay or built-in transfer dialog</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Kitty drag and drop<span>OSC 72, with window-relative coordinates</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Protocol delivery or paste fallback</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Text sizing<span>OSC 66</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Scaled layout; plain text on other hosts</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Multiple cursors<span>Kitty additional cursor protocol</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Translated positions; text fallback</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Kitty graphics<span>Images stored and placed per window</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Move, clip, scroll and overlap</span></td>
+                <td>Passthrough<span>Bypasses the pane model</span></td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong><span>Tracked per pane</span></td>
+              </tr>
+              <tr>
+                <th scope="row">Sixel graphics</th>
+                <td class="matrix-spotlight"><strong>Yes</strong></td><td><strong>Yes</strong><span>Requires a Sixel-enabled build</span></td><td class="matrix-unlisted">Not listed</td><td><strong>Yes</strong></td>
+              </tr>
+              <tr>
+                <th scope="row">Kitty ↔ Sixel translation<span>Child and host can use different image protocols</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Chosen separately for each attached client</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+            </tbody>
+            <tbody>
+              <tr class="matrix-group"><th colspan="5" scope="rowgroup">Silkie capabilities</th></tr>
+              <tr>
+                <th scope="row">Pen, touch and gestures<span>Pressure, tilt, contact capture and pixel scrolling</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Input follows its original window</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Fonts and vector scenes<span>Font roles, scene edits and vector services</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Per-window state and font namespaces</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Deep and wide-gamut colour<span>16 bits a channel, Display P3, Rec. 2020 and HDR brightness</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Kept exactly per cell; nearest 8-bit colour for other hosts</span></td>
+                <td>24-bit RGB<span>8 bits a channel</span></td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Rich image formats<span>Palette, indexed colour, packed, 16-bit and HDR10 images</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Converted for each attached host</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+              <tr>
+                <th scope="row">Display and frame feedback<span>Capability queries, display information and latency</span></th>
+                <td class="matrix-spotlight"><strong>Yes</strong><span>Negotiated with attached hosts</span></td>
+                <td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td><td class="matrix-unlisted">Not listed</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="comparison-notes" id="comparison-notes">
+          <p><strong>Read the entries:</strong> “Yes” includes features implemented or relayed by the multiplexer; host support and configuration still apply. “Not listed” means native support is not described in the cited upstream documentation. Passthrough lets an application send escapes directly to the host; it does not provide per-window state or clipping.</p>
+          <details class="comparison-sources">
+            <summary>Sources and scope</summary>
+            <p>This is a documentation comparison of selected features, not a runtime compatibility test or an exhaustive protocol checklist. Odin Seat’s entries follow its protocol manual and implementation; competitor entries follow the sources below.</p>
+            <ul>
+              <li><a href="https://raw.githubusercontent.com/tmux/tmux/3.8/tmux.1">tmux 3.8 manual</a>: floating panes, extended keys, clipboard settings, Sixel, passthrough, RGB colour, and the <code>progressbar</code> and <code>osc7</code> terminal features with the per-pane progress and path formats. Its <a href="https://github.com/tmux/tmux/blob/3.8/configure.ac">build configuration</a> defines the Sixel option.</li>
+              <li><a href="https://www.gnu.org/software/screen/manual/screen.html">GNU Screen manual</a>: persistent sessions, split regions and documented terminal control sequences.</li>
+              <li><a href="https://zellij.dev/documentation/compatibility.html">Zellij terminal compatibility</a>, <a href="https://zellij.dev/documentation/options.html#support_kitty_keyboard_protocol">keyboard options</a> and <a href="https://zellij.dev/about/">workspace features</a>: clipboard, Kitty keyboard and graphics, Sixel, desktop notifications, program status (OSC 7501), working directory (OSC 7), floating and stacked panes.</li>
+              <li><a href="https://sw.kovidgoyal.net/kitty/protocol-extensions/">Kitty protocol specifications</a> and <a href="https://silkie.goblinreactor.com/protocols/">Silkie protocol specifications</a> define the extensions named here, and the <a href="https://www.superlogical.com/rex/docs/build/program-status">Program Status Protocol</a> defines OSC 7501. Odin Seat also ships <code>man odin-seat-protocols</code>.</li>
+            </ul>
+          </details>
+        </div>
+        <a class="button primary comparison-cta" href="#install">Try Odin Seat <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+
+    <section class="section workflow-section" id="workflow" aria-labelledby="workflow-title">
+      <div class="container workflow-layout">
+        <div>
+          <p class="eyebrow">04 / A familiar rhythm</p>
+          <h2 id="workflow-title">Open. Work.<br>Walk away.<br>Come back.</h2>
+          <p class="section-intro">Run <code>odin-seat</code> to create a session or return to an existing one. The menu is an Alt tap away.</p>
+          <p class="keyboard-note">On terminals that swallow an Alt tap, use <kbd>Ctrl</kbd> + <kbd>\</kbd>. In Ghostty on macOS, set <code>macos-option-as-alt = true</code> so Option reaches the menu.</p>
+        </div>
+        <div class="key-reference">
+          <p class="key-caption">TAP <kbd>Alt</kbd>, RELEASE, THEN…</p>
+          <dl class="key-list">
+            <div><dt><kbd>O</kbd></dt><dd><strong>Open a window</strong><span>Another shell, another place to work.</span></dd></div>
+            <div><dt><kbd>E</kbd></dt><dd><strong>Split the focused window</strong><span>Then R opens on the right; B opens below.</span></dd></div>
+            <div><dt><kbd>K</kbd></dt><dd><strong>Kill a hung program</strong><span>Asks before force-killing its job and shell.</span></dd></div>
+            <div><dt><kbd>R</kbd></dt><dd><strong>Rearrange the desktop</strong><span>Move, resize or snap a window into place.</span></dd></div>
+            <div><dt><kbd>Z</kbd></dt><dd><strong>Zoom the focused window</strong><span>Give the task in front of you more room.</span></dd></div>
+            <div><dt><kbd>M</kbd></dt><dd><strong>Mark and copy</strong><span>Search screen and scrollback; copy a selection.</span></dd></div>
+            <div><dt><kbd>D</kbd></dt><dd><strong>Detach the session</strong><span>Keep every program running in the server.</span></dd></div>
+            <div><dt><kbd>?</kbd></dt><dd><strong>Find your way around</strong><span>The keys, the mouse and terminal setup.</span></dd></div>
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <section class="section install-section" id="install" aria-labelledby="install-title">
+      <div class="container install-layout">
+        <div>
+          <p class="eyebrow">05 / Make yourself at home</p>
+          <h2 id="install-title">Your next<br>terminal session<br>starts here.</h2>
+          <p class="section-intro">Install with one command on macOS or an APT-based Linux distribution, or build from source with a C++23 compiler, Make and zlib.</p>
+          <div class="install-links"><a class="text-link" href="https://brew.goblinreactor.com/">Homebrew packages <span aria-hidden="true">↗</span></a><a class="text-link" href="https://apt.goblinreactor.com/">Linux packages <span aria-hidden="true">↗</span></a></div>
+          <p class="package-note">The package and command are <code>odin-seat</code>. Check the repository catalog for builds matching your operating system and architecture.</p>
+        </div>
+        <div class="install-instructions">
+          <section class="install-panel quick-install" aria-labelledby="quick-install-heading">
+            <div class="code-heading"><h3 id="quick-install-heading">Quick install / macOS + Linux</h3><button class="copy-button" type="button" data-copy="code-quick" hidden>Copy</button></div>
+            <pre><code id="code-quick">curl -fsSL https://xn--hliskjlf-eza0m.goblinreactor.com/install.sh | sh</code></pre>
+            <p class="panel-note">Uses Homebrew on macOS, setting it up if needed, or signed APT packages on Linux. Checks the Linux release and architecture against the repository. May ask for administrator privileges. <a href="install.sh">Read the installer ↗</a></p>
+          </section>
+          <div class="install-tabs" aria-label="Installation options" hidden>
+            <button type="button" id="tab-macos" data-panel="install-macos">macOS</button>
+            <button type="button" id="tab-linux" data-panel="install-linux">Debian / Ubuntu</button>
+            <button type="button" id="tab-source" data-panel="install-source">Source</button>
+          </div>
+          <section class="install-panel" id="install-macos" aria-labelledby="macos-heading">
+            <div class="code-heading"><h3 id="macos-heading">macOS / Homebrew</h3><button class="copy-button" type="button" data-copy="code-macos" hidden>Copy</button></div>
+            <pre><code id="code-macos"><span class="terminal-comment"># Add the Goblin Reactor tap</span>
+brew tap goblinreactor/tap \
+  https://brew.goblinreactor.com/homebrew-tap.git
+
+<span class="terminal-comment"># Install and open your desktop</span>
+brew install goblinreactor/tap/odin-seat
+odin-seat</code></pre>
+            <p class="panel-note">The tap includes the command, manual pages and input-method dictionaries. <a href="https://brew.goblinreactor.com/">Check available bottles ↗</a></p>
+          </section>
+          <section class="install-panel" id="install-linux" aria-labelledby="linux-heading">
+            <div class="code-heading"><h3 id="linux-heading">Debian / Ubuntu</h3><button class="copy-button" type="button" data-copy="code-linux" hidden>Copy</button></div>
+            <p class="panel-prerequisite">First, <a href="https://apt.goblinreactor.com/">add the signed Goblin Reactor repository</a> for your distribution using its setup instructions.</p>
+            <pre><code id="code-linux"><span class="terminal-comment"># After setting up the package repository</span>
+sudo apt update
+sudo apt install odin-seat
+
+<span class="terminal-comment"># Open your desktop</span>
+odin-seat</code></pre>
+            <p class="panel-note">Use the repository’s instructions for your distribution and architecture. <a href="https://apt.goblinreactor.com/">View supported releases ↗</a></p>
+          </section>
+          <section class="install-panel" id="install-source" aria-labelledby="source-heading">
+            <div class="code-heading"><h3 id="source-heading">Build from source</h3><button class="copy-button" type="button" data-copy="code-source" hidden>Copy</button></div>
+            <p class="panel-prerequisite">From a current Odin Seat source checkout, run:</p>
+            <pre><code id="code-source">make
+make test
+make install
+
+<span class="terminal-comment"># The default install prefix is ~/.local</span>
+~/.local/bin/odin-seat</code></pre>
+            <p class="panel-note">Requires a C++23 compiler, Make and zlib development headers. Add <code>~/.local/bin</code> to your PATH to run <code>odin-seat</code> by name.</p>
+          </section>
+          <p class="copy-status" id="copy-status" role="status"></p>
+          <div class="first-session"><span>ONCE YOU’RE IN</span><p><code>odin-seat new-window -- htop</code><br><code>man odin-seat</code><br><code>man odin-seat-protocols</code></p></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      <div class="footer-top"><div><p class="eyebrow">From the Goblin Reactor</p><h2>Small windows.<br>Room for everything.</h2><p>Odin Seat. A desktop for the terminal you already use.</p></div><div class="footer-links"><a href="https://brew.goblinreactor.com/">Packages &amp; source <span aria-hidden="true">↗</span></a><a href="https://silkie.goblinreactor.com/">Meet Silkie <span aria-hidden="true">↗</span></a><a href="https://goblin-core.dev/">Goblin Core <span aria-hidden="true">↗</span></a></div></div>
+      <div class="footer-bottom"><span>© 2026 Adam DePrince · Apache License 2.0</span><a href="#top">Back to the top ↑</a><span>Built for people who live in terminals.</span></div>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""End-to-end checks through a real goblin-view client on a pty.
+"""End-to-end checks through a real odin-seat client on a pty.
 
 A fake host (this script) answers the queries the client sends at
 bootstrap the way a terminal would, then watches what the client paints.
 `kitty_host` chooses whether the emulated terminal speaks kitty graphics:
-Ghostty/kitty do, a plain xterm does not, and goblin-view must degrade to text on
+Ghostty/kitty do, a plain xterm does not, and odin-seat must degrade to text on
 the latter and re-light graphics when a kitty terminal (re)attaches.
 """
 import base64
@@ -21,7 +21,7 @@ import tempfile
 import termios
 import time
 
-GV = os.environ.get("GV", os.path.join(os.path.dirname(__file__), "..", "goblin-view"))
+GV = os.environ.get("GV", os.path.join(os.path.dirname(__file__), "..", "odin-seat"))
 L = "e2e%d" % os.getpid()
 COLS, ROWS, CW, CH = 100, 30, 10, 20
 
@@ -84,7 +84,7 @@ def answer(fd, data, host):
 
 
 def run_client(args, seconds, actions=(), host="kitty"):
-    """Run a goblin-view client under a pty for `seconds`; return what it
+    """Run a odin-seat client under a pty for `seconds`; return what it
     painted. `host` emulates the terminal: "kitty", "sixel", or "text".
     `actions` are (at_seconds, fn(fd)) pairs run once their time comes."""
     todo = sorted(actions, key=lambda a: a[0])
@@ -126,11 +126,11 @@ def finish(pid, fd):
 
 
 # pyenv's startup rehash waits up to 60 s for a stale lock; cap that so it
-# cannot masquerade as a goblin-view stall.
+# cannot masquerade as a odin-seat stall.
 os.environ["PYENV_REHASH_TIMEOUT"] = "1"
 # These image tests assert the inline (direct) transmit bytes; the emit
 # medium (default shared memory) is covered by the term unit test.
-os.environ["GOBLIN_VIEW_KITTY_MEDIUM"] = "direct"
+os.environ["ODIN_SEAT_KITTY_MEDIUM"] = "direct"
 
 # 1. A first window's output shows up without a keypress.
 gob("kill-server")
@@ -155,6 +155,8 @@ gob("kill-server")
 # 3. The Emacs previewer's kitty flow, on a kitty host.
 PNG = (b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhf"
        b"DwAChwGA60e6kgAAAABJRU5ErkJggg==")  # a 1x1 PNG
+# Its one pixel, translucent blue, re-packed: four bytes of RGBA beat the PNG.
+PACKED = b"f=32,s=1,v=1,q=2,m=0;AAD/fw=="
 script = (
     "printf '\\033_Ga=t,q=2,f=100,i=31,m=0;" + PNG.decode() + "\\033\\\\'; "
     "printf '\\0337\\033[3;3H\\033_Gq=2,a=p,i=31,p=1,c=4,r=2\\033\\\\\\0338'; "
@@ -163,9 +165,9 @@ script = (
 )
 pid, fd, out = run_client(["new-session", "--", "bash", "-c", script], 4.0)
 vis = visible(out)
-m = re.search(rb"\x1b_Ga=t,i=(\d+),f=100,q=2,m=0;" + PNG + rb"\x1b\\", out)
+m = re.search(rb"\x1b_Ga=t,i=(\d+)," + re.escape(PACKED) + rb"\x1b\\", out)
 if not m:
-    fail("the image is transmitted to the host once, as PNG")
+    fail("the image is transmitted to the host once, in its tightest form")
 else:
     hid = m.group(1)
     if out.count(b"\x1b_Ga=t,i=" + hid) != 1:
@@ -179,6 +181,33 @@ if b"TEXT_AFTER" not in vis:
     fail("text after the image is painted")
 finish(pid, fd)
 gob("kill-server")
+
+# A redraw must resend unchanged text and images, repeatedly. Exercise
+# the real menu key (Ctrl-\\ fallback), both letter cases, and the script
+# command. Nothing is sent to the child to make it repaint itself.
+for redraw_host in ("kitty", "sixel", "text"):
+    redraw_script_results = []
+
+    def script_redraw(fd):
+        redraw_script_results.append(gob("menu", "f").returncode)
+
+    pid, fd, out = run_client(
+        ["new-session", "--", "bash", "-c", script], 3.5, host=redraw_host,
+        actions=[(1.2, lambda fd: os.write(fd, b"\x1cf")),
+                 (1.8, lambda fd: os.write(fd, b"\x1cF")),
+                 (2.4, script_redraw)])
+    if visible(out).count(b"TEXT_AFTER") < 4:
+        fail("repeated menu redraws resend unchanged text on a " + redraw_host + " host")
+    if out.count(b"\x1b[0m\x1b[H\x1b[2J") < 4:
+        fail("each redraw completely clears the " + redraw_host + " host screen")
+    if redraw_host == "kitty" and out.count(PACKED) < 4:
+        fail("menu redraw retransmits cached kitty images")
+    if redraw_host == "sixel" and out.count(b"\x1bPq") < 4:
+        fail("menu redraw re-emits sixel images")
+    if redraw_script_results != [0]:
+        fail("scripted screen redraw succeeds")
+    finish(pid, fd)
+    gob("kill-server")
 
 # 4. A host WITHOUT kitty graphics: an image the program pushes is painted
 # blank, never as image cells or an APC transmit; ordinary text is fine.
@@ -244,7 +273,7 @@ finish(pid, fd)
 gob("kill-server")
 
 # 8. A sixel-drawing child on a sixel host: its sixel is decoded and
-# re-emitted as sixel (positioned/clipped by goblin-view), so the host
+# re-emitted as sixel (positioned/clipped by odin-seat), so the host
 # still sees one protocol. A red 4-wide sixel band.
 script = (
     "printf '\\033[3;3H\\033Pq#0;2;100;0;0#0!4~$-\\033\\\\'; "
@@ -405,7 +434,7 @@ os.unlink(win.name)
 gob("kill-server")
 
 # 15. Drag-and-drop. The host sends a drop as a bracketed paste (the client
-# enables DECSET 2004 on the host). goblin-view routes it to the focused
+# enables DECSET 2004 on the host). odin-seat routes it to the focused
 # window in that window's own paste mode: wrapped when the program enabled
 # bracketed paste, the bare path when it did not. The echo program prints
 # each received byte as <hh>.
@@ -530,12 +559,12 @@ if "host ?" not in lc:
     fail("an unnamed host shows as ? (got %r)" % lc)
 
 # 15d. File transfer. On a terminal that cannot take files (a text host)
-# goblin-view is the endpoint: a kitty OSC 5113 send raises a yes/no box,
+# odin-seat is the endpoint: a kitty OSC 5113 send raises a yes/no box,
 # Menu y approves it, the program gets the protocol's replies and the
 # file lands in the download directory. On a kitty host the request is
 # forwarded and the host's reply comes back to the program.
 XFER_DIR = tempfile.mkdtemp(prefix="gvdl")
-os.environ["GOBLIN_VIEW_DOWNLOAD_DIR"] = XFER_DIR
+os.environ["ODIN_SEAT_DOWNLOAD_DIR"] = XFER_DIR
 SENDER = r"""import os, tty, sys
 tty.setraw(sys.stdin.fileno())
 def osc(s): os.write(1, b'\033]5113;' + s + b'\033\\')
@@ -670,7 +699,7 @@ os.unlink(prog)
 
 # 15f. Drag and drop (OSC 72) is routed by where the drag is. A window
 # whose program does not take drops gets the dropped files as a paste of
-# their paths: goblin-view accepts on its behalf, asks the host for the
+# their paths: odin-seat accepts on its behalf, asks the host for the
 # text/uri-list and pastes it. A program that said t=a gets the protocol,
 # translated to its own cells, and its answers reach the host.
 DROPPROG = r"""import os, tty, sys
@@ -735,7 +764,7 @@ def dndrun(src, data):
 
 out, vis = dndrun(DROPPROG, URI_DATA)
 if b"\x1b]72;t=m:o=1;text/uri-list text/plain\x1b\\" not in out:
-    fail("over a window that takes no drops, goblin-view accepts the drag")
+    fail("over a window that takes no drops, odin-seat accepts the drag")
 if b"\x1b]72;t=r:x=1\x1b\\" not in out:
     fail("on the drop it asks the host for the uri-list")
 if b"DROPPED:'/tmp/drop me.txt'" not in vis:
@@ -772,20 +801,20 @@ gob("kill-server")
 # not introduce itself (an older build, here simulated) leaves at once
 # with a message instead of typing into the void; a current server is
 # attached to silently.
-os.environ["GOBLIN_VIEW_TEST_NOHELLO"] = "1"
+os.environ["ODIN_SEAT_TEST_NOHELLO"] = "1"
 gob("new-session", "-s", "old", "-d", "-x", "80", "-y", "24", "--", "sleep", "30")
-del os.environ["GOBLIN_VIEW_TEST_NOHELLO"]
+del os.environ["ODIN_SEAT_TEST_NOHELLO"]
 time.sleep(0.4)
 pid, fd, out = run_client(["attach", "-s", "old"], 1.5, host="kitty")
 finish(pid, fd)
-if b"older goblin-view" not in out or b"kill-server" not in out:
+if b"older odin-seat" not in out or b"kill-server" not in out:
     fail("a client of a server that cannot introduce itself says so and leaves")
 gob("kill-server")
 # A server of another protocol (here posing as protocol 1) is refused too,
 # naming both versions and the socket, before a single key is typed.
-os.environ["GOBLIN_VIEW_TEST_PROTO"] = "1"
+os.environ["ODIN_SEAT_TEST_PROTO"] = "1"
 gob("new-session", "-s", "other", "-d", "-x", "80", "-y", "24", "--", "sleep", "30")
-del os.environ["GOBLIN_VIEW_TEST_PROTO"]
+del os.environ["ODIN_SEAT_TEST_PROTO"]
 time.sleep(0.4)
 pid, fd, out = run_client(["attach", "-s", "other"], 1.5, host="kitty")
 finish(pid, fd)
@@ -796,7 +825,7 @@ if b"\x1b[?2026h" in out:
 gob("kill-server")
 pid, fd, out = run_client(["new-session", "--", "sleep", "30"], 1.5, host="kitty")
 finish(pid, fd)
-if b"older goblin-view" in out or b"protocol" in out:
+if b"older odin-seat" in out or b"protocol" in out:
     fail("a current server is attached to without complaint")
 gob("kill-server")
 
@@ -813,7 +842,7 @@ if b"\x1b]22;\x1b\\" not in out[-200:] or b"\x1b]112\x1b\\" not in out[-200:]:
     fail("the pointer shape and cursor colour are reset on the way out")
 gob("kill-server")
 
-# 15j. A black-and-white client (-m, or GOBLIN_VIEW_MONO=1) is painted with
+# 15j. A black-and-white client (-m, or ODIN_SEAT_MONO=1) is painted with
 # default colours and reverse video only, whatever the programs draw; a
 # normal client sees the colours.
 COLOURS = re.compile(rb"\x1b\[[0-9;:]*m")
@@ -837,13 +866,13 @@ if b"RED" not in visible(out) or b"GREEN" not in visible(out):
     fail("the text itself still reaches a -m client")
 if not re.search(rb"\x1b\[(?:[0-9;:]*;)?7(?:;|m)", out):
     fail("the title bar is reverse video on a -m client")
-os.environ["GOBLIN_VIEW_MONO"] = "1"
+os.environ["ODIN_SEAT_MONO"] = "1"
 pid, fd, out = run_client(["new-session", "--", "bash", "-c", PAINT], 2.0, host="text")
 finish(pid, fd)
 gob("kill-server")
-del os.environ["GOBLIN_VIEW_MONO"]
+del os.environ["ODIN_SEAT_MONO"]
 if colour_params(out):
-    fail("GOBLIN_VIEW_MONO=1 paints without colours")
+    fail("ODIN_SEAT_MONO=1 paints without colours")
 pid, fd, out = run_client(["new-session", "--", "bash", "-c", PAINT], 2.0, host="text")
 finish(pid, fd)
 gob("kill-server")
@@ -857,7 +886,7 @@ if not colour_params(out):
 cfgdir = tempfile.mkdtemp(prefix="gvcfg")
 cfgfile = os.path.join(cfgdir, "config")
 open(cfgfile, "w").write('backdrop = "."\nscrollback = 50\n[host "kitty"]\nmono = yes\n[host "foot"]\nmenu-key = none\n')
-os.environ["GOBLIN_VIEW_CONFIG"] = cfgfile
+os.environ["ODIN_SEAT_CONFIG"] = cfgfile
 pid, fd, out = run_client(["new-session", "--", "sleep", "30"], 1.8, host="kitty")
 finish(pid, fd)
 gob("kill-server")
@@ -876,7 +905,7 @@ if not colour_params(out):
     fail("the foot host is not mono (its section says nothing about it)")
 if b"\xe2\x96\x91" in out or out.count(b"...") < 5:
     fail("the configured backdrop glyph is painted instead of the stipple")
-del os.environ["GOBLIN_VIEW_CONFIG"]
+del os.environ["ODIN_SEAT_CONFIG"]
 shutil.rmtree(cfgdir, ignore_errors=True)
 
 # 15l. Scripting: send-keys types into a window (C escapes decoded unless
@@ -1023,7 +1052,7 @@ pid, fd, out = run_client(["new-session", "--", "bash", "--norc", "--noprofile"]
 if upg.returncode != 0 or "upgraded" not in upg.stdout:
     fail("upgrade replaces the server in place (got rc=%d %r)" % (upg.returncode, upg.stdout))
 vis = visible(out)
-if b"older goblin-view" in out or b"protocol" in out:
+if b"older odin-seat" in out or b"protocol" in out:
     fail("a current client attached across the upgrade is not told off")
 if b"LIVE_" not in vis:
     fail("the attached terminal keeps receiving frames after the upgrade")
@@ -1035,7 +1064,7 @@ if not pids or not live or pids[0] != live[0]:
 if "1\n2\n3\n" not in cap.replace("\r", ""):
     fail("the scrollback survives the upgrade")
 finish(pid, fd)
-r = gob("upgrade", "/nonexistent/goblin-view")
+r = gob("upgrade", "/nonexistent/odin-seat")
 if r.returncode == 0 or "nonexistent" not in r.stdout:
     fail("an upgrade to a missing binary fails cleanly")
 if gob("list-windows").returncode != 0:

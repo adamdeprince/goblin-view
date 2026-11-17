@@ -1,4 +1,4 @@
-/goblin-view
+/odin-seat
 /test-codec
 /test-config
 /test-desktop
@@ -15,6 +15,7 @@ src/*.o
 src/tmuxport/*.o
 .DS_Store
 /tmp
+/deploy/
 *.log
 .track-tmux-drift
 __pycache__/
@@ -33,3 +34,5 @@ share/pinyin.txt
 share/wubi86_jidian.dict.yaml
 share/Unihan_Readings.txt
 share/Unihan.zip
+
+/test-notifications

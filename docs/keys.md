@@ -3,14 +3,14 @@
 The menu key is an isolated **Alt tap** (press Alt, release it without
 another key), not a chord. Applications keep Ctrl/Alt combinations.
 
-goblin-view runs best on **Ghostty**. On attach we push kitty keyboard flags 11
+odin-seat runs best on **Ghostty**. On attach we push kitty keyboard flags 11
 (disambiguate + event types + report-all) so Ghostty reports Alt
 press and release. Alt press then Alt release with nothing in between
 opens the menu. Alt+letter as a chord is forwarded to the focused window.
 
 Ctrl-\\ is the same key for tests and for a terminal that swallows the Alt
 tap. On macOS set `macos-option-as-alt = true` in `~/.config/ghostty/config`
-so the Option tap reaches goblin-view. Menu `?` shows a help box with the
+so the Option tap reaches odin-seat. Menu `?` shows a help box with the
 keys, the mouse, and this setup.
 
 Esc dismisses an open menu. A lone ESC is indistinguishable from the
@@ -25,9 +25,11 @@ the menu is drawn now: see **Drawing** below.
 
 Wired up today: `O`, `C`, `R` (rearrange), `Z`, `M` (mark: copy mode),
 `T` (transfer), `H` (hide), `S` (switch list), `B` (broadcast), `U`,
-`I`, `?`, `D` (detach), `Q` and `1`-`9`. Windows overlap: the compositor paints every visible window in
+`I`, `?`, `F` (screen redraw), `D` (detach), `Q`, `1`-`9`, `X`/`A`
+(select) and `L` (layout). Windows overlap: the compositor paints every visible window in
 z-order with a frame, focused on top, on a stippled backdrop. Rearrange:
-`R` then `M` move / `R` resize / `P` then `1-9` snap. Arrows nudge one
+`R` then `M` move / `R` resize / `P` then `1-9` snap / an arrow for that
+half of the desktop. In move and resize, arrows nudge one
 cell, Shift-arrows five. Enter keeps it, Esc restores.
 
 | key | command |
@@ -37,15 +39,19 @@ cell, Shift-arrows five. Enter keeps it, Esc restores.
 | C | Close Window |
 | R | Rearrange |
 | Z | Zoom |
+| F | Screen redraw (repaint this terminal's text and images from scratch) |
 | M | Mark: copy mode (hjkl/arrows, v select, / ? search, y copies) |
 | T | Transfer: paste the mark into the focused window |
 | H | Hide the focused window (its number or S brings it back) |
-| B | Broadcast typing to every window (toggle) |
+| B | Broadcast typing to the selected windows, or to every window when none is selected (toggle) |
+| X | Select or unselect the focused window (also the mark on its frame, and Tab in the switch list) |
+| A | Select every window that shows; again, none |
+| L | Layout the selected windows (or all): `F` full and stacked, `G` grid, `H` rows, `V` columns, `2` two columns |
 | U | Unicode keyboard (browse & insert a glyph) |
 | I | Input method (chooser) |
 | ? | Help |
 | D | Detach (leave the session running) |
-| Q | Quit goblin-view (asks y/n, then closes everything) |
+| Q | Quit odin-seat (asks y/n, then closes everything) |
 | 1–9 | Switch to that window (first nine; mouse selects any) |
 
 The menu key then a letter works without waiting for the menu to be read.
@@ -60,10 +66,12 @@ glyph directly. Esc closes it. `src/unicode.cc` holds the tables and the
 one layout function that both the painter and the click hit-test use.
 
 A program can resize its own window with XTWINOPS `CSI 8 ; rows ; cols t`
-(what many terminals accept to resize the window). goblin-view resizes the
+(what many terminals accept to resize the window). odin-seat resizes the
 window to match, shifting the top-left in if it would run past the right or
 bottom edge, and capping at the desktop size when the request is larger
-than fits.
+than fits. Window content has a minimum size of 1×1. Shrinking the desktop
+moves off-screen windows back into view; borders are temporarily hidden
+when the desktop cannot fit a border around even one content cell.
 
 ## Text selection and copy
 
@@ -76,7 +84,7 @@ clipboard through any outer multiplexer. A plain click clears the
 selection.
 
 A drag-and-drop onto the terminal arrives from the host as a bracketed
-paste (the client turns on DECSET 2004 there). goblin-view delivers it to
+paste (the client turns on DECSET 2004 there). odin-seat delivers it to
 the focused window in that window's own paste mode: wrapped in
 `ESC[200~`/`ESC[201~` when the program enabled bracketed paste, and as the
 bare path when it did not, so the markers never leak into a program that
@@ -133,7 +141,7 @@ window can use".
   window is a kitty *endpoint*: it reassembles the transmission (`m=1` …
   `m=0`, the way gnuplot's `kittycairo` sends a PNG in ~4 KB pieces),
   answers the program's queries, and keeps the pixels. The program's
-  bytes never reach the host. goblin-view is in turn a kitty *client* of the host:
+  bytes never reach the host. odin-seat is in turn a kitty *client* of the host:
   it re-transmits the stored pixels under a remapped, host-global id
   (`DV_KITTY_FIRST_ID` + window, as tmux remaps) and issues a placement
   where the window sits. Moving the window re-issues only the placement,
@@ -146,12 +154,12 @@ window can use".
   work, tracked against `~/dev/tmux` in `docs/tmux-tracking.md`.
 - **OSC-52** clipboard, both directions. A *set* is forwarded to every
   attached terminal verbatim. A *read* (`52;<sel>;?`) is sent to one
-  attached terminal, and goblin-view remembers which window asked; the host's
+  attached terminal, and odin-seat remembers which window asked; the host's
   reply is recognised as an OSC (not keystrokes), carried whole even
   when it arrives in pieces, and delivered to that window -- whatever is
   focused by then. A read with nobody attached is answered at once with
   an empty clipboard for the same selection so the program never blocks.
-  If goblin-view is nested inside tmux/goblin-tmux (`$TMUX` set) the client wraps
+  If odin-seat is nested inside tmux/goblin-tmux (`$TMUX` set) the client wraps
   outgoing sequences in the tmux passthrough so they reach the outermost
   terminal; replies come back through it untouched.
 
@@ -178,17 +186,19 @@ click means:
   moving/resizing. Pushing a window past the right or bottom edge shrinks
   it so its far edge stays on-screen.
 
-The same is scriptable over the socket: `goblin-view mouse [-s name]
+The same is scriptable over the socket: `odin-seat mouse [-s name]
 press|drag|release x y`.
 
 ## Detach and reattach
 
 Each window is a terminal emulator whose grid, cursor and modes live in
 the server, so the session survives with everything running when no
-client is attached. Menu `D` detaches; `goblin-view` reattaches. `Q` tears the
-whole server down. With two clients attached the desktop is sized to the
-**largest**; a smaller client scrolls a viewport that follows the
-focused window.
+client is attached. Menu `D` detaches; `odin-seat` reattaches. `Q` tears the
+whole server down. With several clients attached the desktop has the rows
+and columns of the **smallest** in each dimension, as in tmux, so each
+shows all of it; what programs are told a terminal can show (pixels in a
+cell, gamut, depth) is the **most** any of them can, and each is sent
+pictures scaled or converted to its own.
 
 ## Rearrange
 
@@ -198,6 +208,7 @@ focused window.
 | R | Resize (arrows, top-left of the inner area stays put) |
 | S | Scroll (viewport into a locked logical size) |
 | P | Position (snap 1–9, computed from the **current** desktop size) |
+| ← ↑ ↓ → | That half of the desktop (also the arrows on the window's frame) |
 | F | Freeze (`SIGSTOP`) |
 | H | Hide |
 | A | Put Aside |

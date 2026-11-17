@@ -1,9 +1,11 @@
-.TH GOBLIN-VIEW 1 2026-09-08 "goblin-view 0.1.0" "User Commands"
+.TH ODIN-SEAT 1 2026-10-15 "Odin Seat 0.1.0" "User Commands"
 .SH NAME
-goblin-view \- terminal multiplexer with overlapping windows and an Alt-tap menu
+odin-seat \- terminal multiplexer
+with overlapping windows and an Alt-tap menu
 .SH SYNOPSIS
-.B goblin-view
+.B odin-seat
 .RB [ \-Dv ]
+.RB [ \-\-3d\-focus=\fIpixels\fP ]
 .RB [ \-L
 .IR name ]
 .RB [ \-S
@@ -12,14 +14,14 @@ goblin-view \- terminal multiplexer with overlapping windows and an Alt-tap menu
 .RI [ argument
 \&.\|.\|.]]
 .SH DESCRIPTION
-.B goblin-view
+.B odin-seat
 keeps a desktop of overlapping terminal windows in a server process and
 paints it into the terminal you run it from.
 Each window is a terminal emulator of its own whose screen, cursor and
 modes live in the server, so a session survives detaching and every
 program in it keeps running.
 Run
-.B goblin-view
+.B odin-seat
 with no command to attach to the default session, creating it with one
 window if it does not exist.
 .PP
@@ -57,8 +59,25 @@ plain paper; dim, blink and underline colours are dropped, and no cursor
 colour is sent.
 Only this client is affected; another terminal attached to the same
 session keeps its colours.
-.B GOBLIN_VIEW_MONO=1
+.B ODIN_SEAT_MONO=1
 in the environment does the same.
+.TP
+.BI \-\-3d\-focus= pixels
+On a terminal that draws Silkie stereo depth (it listed
+.BR depth.1 ),
+show the focused window, its frame and everything in it, text and images,
+.I pixels
+reference pixels nearer than the rest of the desktop; a negative number
+puts it farther away.
+The program's own depths inside the window move with it.
+A depth given in millidegrees moves by the pixels at Silkie's default
+52-degree field of view.
+Moving focus repaints this terminal, and its images are placed again at
+their new depth without sending their pixels.
+Only this client is affected.
+Silkie shows content in front of the screen only when its
+.B spatial_negative_divergence
+setting allows it, which it does not by default.
 .TP
 .B \-v
 Verbose logging on standard error.
@@ -81,9 +100,18 @@ Print the version and exit.
 .TP
 .B \-h
 Print a usage summary and exit.
+.PP
+The global -A option explicitly authorizes the attached client's local
+SSH_AUTH_SOCK as a fallback when the terminal has no provider. For example:
+.nf
+odin-seat -A attach
+.fi
+The native terminal provider is preferred. This lets a fresh SSH-forwarded
+agent follow the attaching client, without leaving the session's applications
+bound to a stale SSH login socket.
 .SH COMMANDS
 With no command,
-.B goblin-view
+.B odin-seat
 attaches, creating a session if none exists.
 Where a command takes
 .BI \-s " name"
@@ -94,9 +122,16 @@ is the program to run in a new window; the default is your shell.
 .TP
 .BI "attach [\-s " name ]
 Attach this terminal to a session.
-Two terminals may attach at once: the desktop is sized to the largest of
-them and a smaller one scrolls its viewport to follow the focused
-window.
+Several terminals may attach at once.
+The desktop then has the rows and the columns of the smallest of them in
+each dimension, as in
+.BR tmux (1),
+so each shows all of it; a terminal that leaves gives its rows and columns
+back.
+What a terminal can show is the most any of them can: programs are told
+the cell with the most pixels, the widest gamut and the deepest display,
+and each terminal is sent pictures and colours scaled or converted to its
+own.
 .TP
 .BI "new-session [\-d] [\-x " cols "] [\-y " rows "] [\-s " name "] [\-\- " program " .\|.\|.]"
 Create a session with one window.
@@ -109,6 +144,25 @@ creates it detached, sized
 Open another window in a session.
 Run from inside a window it acts on the desktop you are in.
 .TP
+.BI "split-window [\-h|\-v] [\-s " name "] [\-w " N "] [\-\- " program " .\|.\|.]"
+Divide the selected window and open a new program in the other half.
+.B \-h
+opens on the right (the default);
+.B \-v
+opens below.
+The default target is the focused window.
+Other windows keep their geometry, and both halves remain independently
+movable windows. A zoomed window splits across the whole desktop.
+If two frames and a content cell in each cannot fit, the command fails
+without changing the original window.
+.TP
+.BI "kill-window [\-f] [\-s " name "] [\-w " N ]
+Close the selected window, normally sending a hangup to its program.
+.B \-f
+instead sends SIGKILL to the foreground process group, the shell's process
+group and the shell before closing the window. It requires no confirmation;
+unsaved work in those programs is lost.
+.TP
 .BI "list-windows [\-s " name ]
 One line per window: session, number, program, size, position,
 stacking order and focus.
@@ -120,6 +174,16 @@ One line per session with its desktop size.
 One line per attached terminal: session, size, TERM, the terminal's own
 name as reported by XTVERSION, and what it can do (kitty graphics,
 sixel, cell pixel sizes).
+.TP
+.BI "agent-socket [\-s " name ]
+Print the session's stable SSH_AUTH_SOCK pathname. New windows receive it
+automatically. In an older shell, run:
+.nf
+export SSH_AUTH_SOCK="$(odin-seat agent-socket)"
+.fi
+Agent requests follow the most recently attached display; existing connections
+fail when the provider changes, and new connections use its keys. See
+.BR odin-seat-protocols (7).
 .TP
 .BI "kill-session [" name ]
 End a session and every program in it.
@@ -135,7 +199,7 @@ Press a menu key from a script, as if the menu key had been tapped and
 .I key
 typed:
 a menu letter
-.RB ( o ", " c ", " z ", " r ", " m ", " t ", " h ", " s ", " b ", " u ", " i ", " d ", " q ", " ? ", " 1 \- 9 ),
+.RB ( o ", " c ", " e ", " k ", " z ", " r ", " f ", " m ", " t ", " h ", " s ", " b ", " u ", " i ", " d ", " q ", " ? ", " 1 \- 9 ),
 or one of
 .BR menu ", " esc ", " enter ", " tab ", " backspace ", " up ", " down ", " left ", " right .
 In copy mode or the switch list every key goes to that mode, so a script
@@ -172,9 +236,9 @@ from now on; without a path, stop.
 Write every session's windows to
 .I file
 (default
-.IR $XDG_STATE_HOME/goblin-view/sessions ,
+.IR $XDG_STATE_HOME/odin-seat/sessions ,
 or
-.IR ~/.local/state/goblin-view/sessions ):
+.IR ~/.local/state/odin-seat/sessions ):
 place, size, title, flags, stacking, the directory each program is in
 now, and the command it was started with.
 .TP
@@ -186,7 +250,7 @@ in its saved directory; a session that already exists is left alone.
 Replace the running server, in place, with
 .I binary
 (by default the
-.B goblin-view
+.B odin-seat
 running this command): the server writes its state, hands its
 descriptors to the new program and executes it in the same process, so
 every program in every window and every attached terminal carries on.
@@ -194,7 +258,7 @@ Screens, scrollback, modes, keyboard flags, colours and layout survive;
 images are dropped until the program draws them again.
 A client that finds an older server able to do this upgrades it before
 attaching, so after installing a new
-.B goblin-view
+.B odin-seat
 the next attach is enough.
 .TP
 .BI "mouse [\-s " name "] " event " " x " " y " [" button ]
@@ -212,8 +276,28 @@ Open a new window, framed, on top.
 .B C
 Close the focused window (its program is hung up).
 .TP
+.B E
+Split the focused window: then
+.B R
+opens on the right and
+.B B
+opens below; Esc cancels.
+.TP
+.B K
+Force-kill the focused window's foreground job and shell after a
+.BR y / n
+confirmation. The question stays associated with that window if another
+client changes focus. Unsaved work is lost.
+.TP
 .B Z
 Zoom the focused window to the whole desktop, or back.
+.TP
+.B F
+Screen redraw: repaint this terminal's text and images from scratch
+when the display is garbled.
+From a script,
+.B odin-seat menu f
+redraws every terminal attached to the session.
 .TP
 .B R
 Rearrange: then
@@ -225,8 +309,43 @@ resizes with the arrows (Shift moves five), Enter finishes;
 then
 .B 1\-9
 snaps the window to a ninth of the desktop;
+an arrow alone sends it to that half of the desktop, left, right, top or
+bottom;
 .B H
 hides it.
+The four arrows on a window's frame, right of its title, do the same for
+that window with a click.
+.TP
+.B X
+Select the focused window, or unselect it.
+A selected window fills the mark at the right of its frame, which a click
+also toggles, and so does Tab on its row of the switch list.
+The selected windows are the ones
+.B L
+lays out and
+.B B
+types to.
+.TP
+.B A
+Select every window that shows; again, none.
+.TP
+.B L
+Layout: arrange the selected windows together, or every window that
+shows when none is selected.
+Then
+.B F
+makes each the full desktop, one on another;
+.B G
+a grid, as near square on the screen as it allows, a short last row
+sharing the width;
+.B H
+horizontal bars, each the full width;
+.B V
+vertical bars, each the full height;
+.B 2
+two columns with the windows shared between them.
+The windows go in the order of their numbers and share the desktop
+exactly, each program is told its new size, and Esc leaves them alone.
 .TP
 .B 1\-9
 Focus that window and raise it.
@@ -253,8 +372,14 @@ Type to filter by number, title or command; arrows move, Enter raises
 the chosen window (unhiding it), Esc cancels.
 .TP
 .B B
-Broadcast: while on, typing goes to every window in the session, each in
-its own keyboard encoding; a status line says so.
+Broadcast: while on, typing goes to several windows at once, each in
+its own keyboard encoding.
+With windows selected
+.RB ( X ),
+they are a group: what is typed in one of them goes to them all, and what
+is typed in a window outside the group stays there.
+With none selected it goes to every window in the session.
+A status line says which.
 .B B
 again stops it.
 .TP
@@ -276,7 +401,7 @@ Detach; the session and its programs keep running.
 .TP
 .B Q
 Quit
-.B goblin-view
+.B odin-seat
 after a
 .BR y / n
 confirmation, closing every window.
@@ -332,7 +457,7 @@ Programs that track the mouse get their events in the window's own
 coordinates, including motion for programs asking for it and pixel
 positions for programs asking for those.
 .SH TERMINALS
-.B goblin-view
+.B odin-seat
 runs in any terminal.
 It runs best in one that speaks the kitty keyboard protocol, reports
 cell pixel sizes and shows images: Ghostty and kitty.
@@ -358,12 +483,16 @@ kitty needs nothing.
 .PP
 Images drawn by programs (kitty graphics or sixel) are shown in whatever
 the terminal you attach from speaks: re-emitted as kitty graphics,
-rasterised to sixel, or blanked.
-A text-only client attached beside a graphical one sees blanks where the
-other sees the picture.
+rasterised to sixel, or, on a terminal with neither, drawn as coloured
+half-block cells, one pixel by two to the cell (see
+.BR cell-pictures ).
+Vector scenes and HDR pixels are offered to programs whatever is attached:
+a terminal that cannot draw a scene is sent it drawn.
 Programs that use Silkie's OSC 777 extensions are answered here too:
 only the selectors and picture formats the attached terminals listed,
-and that goblin-view can carry, are offered.
+and that odin-seat can carry, are offered.
+That includes Silkie's font selection, vector images and session fonts,
+which reach a terminal attached later as well.
 .PP
 A file a program offers (kitty file transfer, or goblin-mosh's
 download) is handed to the terminal when it speaks that protocol.
@@ -373,13 +502,13 @@ nothing is saved, opened or run without a
 typed at that box.
 A drop onto a window lands in the window and cell it was dropped on.
 See
-.BR goblin-view-protocols (7).
+.BR odin-seat-protocols (7).
 .SH CONFIGURATION FILE
-.I ~/.config/goblin-view/config
+.I ~/.config/odin-seat/config
 (or
-.IR $XDG_CONFIG_HOME/goblin-view/config ,
+.IR $XDG_CONFIG_HOME/odin-seat/config ,
 or the file
-.B GOBLIN_VIEW_CONFIG
+.B ODIN_SEAT_CONFIG
 names) holds
 .I key = value
 lines; a
@@ -393,7 +522,7 @@ matches "kitty(0.48.2)").
 An environment variable naming the same thing wins over the file; a
 command-line option wins over both.
 Problems are reported when
-.B goblin-view
+.B odin-seat
 starts.
 The keys:
 .TP
@@ -405,12 +534,12 @@ Lines of scrollback kept per window; default 1000.
 .TP
 .B download-dir
 Where received files are saved (see
-.BR GOBLIN_VIEW_DOWNLOAD_DIR ).
+.BR ODIN_SEAT_DOWNLOAD_DIR ).
 .TP
 .B kitty-medium
 .BR shm ", " tempfile ", " file " or " direct
 (see
-.BR GOBLIN_VIEW_KITTY_MEDIUM ).
+.BR ODIN_SEAT_KITTY_MEDIUM ).
 .TP
 .B term
 The TERM given to programs in windows.
@@ -422,6 +551,15 @@ block.
 .B click-raises
 .BR yes " (default) or " no :
 whether a click raises the window it focuses.
+.TP
+.B cell-pictures
+.BR yes " (default) or " no :
+whether a terminal with neither kitty graphics nor sixel is drawn pictures
+as coloured half-block cells.
+With
+.B no
+such a terminal is told there are no pictures, and programs fall back to
+text themselves.
 .TP
 .B mono
 .BR yes " or " no :
@@ -438,7 +576,7 @@ up to and including its final byte).
 Cursor motion and editing that name a count still stop at the edge of
 the screen.
 The same value may be set with
-.BR GOBLIN_VIEW_CSI_LIMIT ,
+.BR ODIN_SEAT_CSI_LIMIT ,
 which wins over the file.
 .TP
 .B escape-limit
@@ -448,7 +586,7 @@ its introducer and terminator.
 (the default) means no limit, so a vector image or any other payload is
 kept whole. A longer sequence is discarded and not acted on.
 The same value may be set with
-.BR GOBLIN_VIEW_ESCAPE_LIMIT ,
+.BR ODIN_SEAT_ESCAPE_LIMIT ,
 which wins over the file.
 .TP
 .B menu-key
@@ -470,10 +608,10 @@ menu-key = ctrl-backslash
 .fi
 .SH ENVIRONMENT
 .TP
-.B GOBLIN_VIEW_CONFIG
+.B ODIN_SEAT_CONFIG
 The configuration file to read instead of the default.
 .TP
-.B GOBLIN_VIEW_KITTY_MEDIUM
+.B ODIN_SEAT_KITTY_MEDIUM
 How images are handed to the terminal:
 .BR shm " (the default), " tempfile ", " file " or " direct .
 Use
@@ -481,12 +619,12 @@ Use
 when the terminal is on the far end of a link where a local file or
 shared memory would not be, such as a nested ssh session.
 .TP
-.B GOBLIN_VIEW_MONO
+.B ODIN_SEAT_MONO
 When set (and not 0), the same as
 .BR \-m :
 strict black and white for this terminal.
 .TP
-.B GOBLIN_VIEW_DOWNLOAD_DIR
+.B ODIN_SEAT_DOWNLOAD_DIR
 Where received files are saved.
 Otherwise
 .BR $XDG_DOWNLOAD_DIR ,
@@ -497,33 +635,33 @@ whichever exists, else
 Files are published without overwriting:
 .IR report.pdf ", then " report.pdf.1 .
 .TP
-.B GOBLIN_VIEW_CSI_LIMIT
+.B ODIN_SEAT_CSI_LIMIT
 Maximum bytes of one CSI sequence. Overrides
 .B csi-limit
 in the configuration file.
 .B 0
 means no limit.
 .TP
-.B GOBLIN_VIEW_ESCAPE_LIMIT
+.B ODIN_SEAT_ESCAPE_LIMIT
 Maximum bytes of one OSC, APC or DCS payload. Overrides
 .B escape-limit
 in the configuration file.
 .B 0
 means no limit.
 .TP
-.B GOBLIN_VIEW_TERM
+.B ODIN_SEAT_TERM
 The
 .B TERM
 given to programs in windows; the default is
 .BR xterm\-256color .
 .TP
-.B GOBLIN_VIEW_TRACE
+.B ODIN_SEAT_TRACE
 A file to which the client appends everything it paints to the
 terminal, for telling a frame not shown from one never sent.
 .TP
-.B GOBLIN_VIEW_SOCK
+.B ODIN_SEAT_SOCK
 Set in every window to the session's socket, so a
-.B goblin-view
+.B odin-seat
 run inside a window acts on that desktop instead of nesting.
 .TP
 .B TMUX
@@ -531,17 +669,17 @@ When set, the client is inside tmux and wraps what it hands the outer
 terminal (clipboard, images) in the tmux passthrough.
 .SH FILES
 .TP
-.IR /tmp/goblin-view\- uid / name
+.IR /tmp/odin-seat\- uid / name
 The server's socket; one per
 .BR \-L " name."
 .TP
-.I ~/.local/share/goblin-view
+.I ~/.local/share/odin-seat
 Input method dictionaries (set at build time by the install prefix).
 .TP
-.I ~/.config/goblin-view/config
+.I ~/.config/odin-seat/config
 The configuration file.
 .TP
-.I ~/.local/state/goblin-view/sessions
+.I ~/.local/state/odin-seat/sessions
 Where
 .B save
 writes and
@@ -554,10 +692,10 @@ when that server can be upgraded (see
 .BR upgrade );
 one too old for that is refused with a message, and closing its windows
 and running
-.B goblin-view kill-server
+.B odin-seat kill-server
 replaces it.
 A client older than the server is told to run the newer one.
 .SH SEE ALSO
-.BR goblin-view-protocols (7),
+.BR odin-seat-protocols (7),
 .BR tmux (1),
 .BR kitty (1)

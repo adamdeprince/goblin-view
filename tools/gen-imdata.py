@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate GoblinView input-method tables from permissively-licensed sources.
+"""Generate Odin Seat input-method tables from permissively-licensed sources.
 
 Pinyin: mozillazg/pinyin-data (MIT), whose readings come from the Unicode
         Unihan database (Unicode license). Candidates are ordered
@@ -116,7 +116,7 @@ def gen_pinyin():
                 cur[ch] = rank
     out = os.path.join(SHARE, "pinyin.dict")
     with open(out, "w", encoding="utf-8") as f:
-        f.write("# GoblinView pinyin table. Source: mozillazg/pinyin-data "
+        f.write("# Odin Seat pinyin table. Source: mozillazg/pinyin-data "
                 "(MIT) over Unicode Unihan; frequency from Unihan "
                 "kHanyuPinlu (Unicode license).\n")
         for s in sorted(syl):
@@ -146,7 +146,7 @@ def gen_wubi():
         code.setdefault(c, []).append((w, text))
     out = os.path.join(SHARE, "wubi.dict")
     with open(out, "w", encoding="utf-8") as f:
-        f.write("# GoblinView wubi86 table. Source: KyleBing/"
+        f.write("# Odin Seat wubi86 table. Source: KyleBing/"
                 "rime-wubi86-jidian (Apache-2.0), sorted by its weights.\n")
         for c in sorted(code):
             cands = [t for _, t in sorted(code[c], key=lambda x: -x[0])][:CAP_WB]

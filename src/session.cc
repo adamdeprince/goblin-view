@@ -3,6 +3,8 @@
  */
 
 #include "dv.hpp"
+#include "pstatus.hpp"
+#include "agent.hpp"
 
 #include <string.h>
 
@@ -34,6 +36,7 @@ dv_session_create(const char *name, struct dv_size sz)
 	struct dv_session	*s;
 
 	s = dv_new<dv_session>();
+	s->host_unfocused = 1;
 	dv_strlcpy(s->name, name != NULL && name[0] != '\0' ? name : "0",
 	    sizeof s->name);
 	dv_desktop_init(&s->desktop, sz);
@@ -51,5 +54,13 @@ dv_session_destroy(struct dv_session *s)
 	TAILQ_REMOVE(&dv_srv->sessions, s, entry);
 	dv_buf_free(&s->paste);
 	dv_buf_free(&s->mark);
+	dv_silkie_free_session(s);
+	dv_pstatus_session_gone(s);
+	dv_kitty_free_session(s);
+	dv_agent_free(s);
+	free(s->notification_scope);
+	free(s->xcur_map);
+	delete s->owner;
+	dv_flat_free(s);
 	free(s);
 }

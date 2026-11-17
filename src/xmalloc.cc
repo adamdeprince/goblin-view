@@ -78,6 +78,16 @@ xasprintf(const char *fmt, ...)
 	return (s);
 }
 
+/* Replace a heap string; NULL leaves it empty. */
+void
+dv_strset(char **dst, const char *src)
+{
+	char	*n = src != NULL ? xstrdup(src) : NULL;
+
+	free(*dst);
+	*dst = n;
+}
+
 size_t
 dv_strlcpy(char *dst, const char *src, size_t dstsz)
 {

@@ -1,7 +1,7 @@
 # Goblin pointer protocol, version 1
 
 This is an open, experimental terminal extension shared by Inkline, Goblin
-Skiff and GoblinView. It is separate from USB HID and the Kitty graphics
+Skiff and Odin Seat. It is separate from USB HID and the Kitty graphics
 protocol. Applications choose whether they want enriched pen/touch input.
 An ordinary shell keeps local selection and tablet navigation. Existing
 applications requesting xterm mouse reporting receive translated mouse events.

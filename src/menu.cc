@@ -9,7 +9,9 @@
  */
 
 #include "dv.hpp"
+#include "pstatus.hpp"
 
+#include <algorithm>
 #include <string.h>
 #include <strings.h>
 
@@ -20,23 +22,24 @@
 static const struct dv_menu_item menu_items[] = {
 	{ "O",   "Open Window" },
 	{ "C",   "Close Window" },
+	{ "E",   "Split window (right / below)" },
+	{ "K",   "Kill hung window (asks first)" },
 	{ "Z",   "Zoom (toggle full screen)" },
-	{ "R",   "Rearrange (move / resize)" },
+	{ "R",   "Rearrange (move / resize / halves)" },
+	{ "X A", "Select this window / all or none" },
+	{ "L",   "Layout: tile the selected windows" },
+	{ "B",   "Broadcast typing (selected, or all)" },
+	{ "F",   "Screen redraw" },
 	{ "1-9", "Select window  (mouse: any)" },
-	{ "U",   "Unicode keyboard" },
-	{ "I",   "Input method (pinyin, romaji...)" },
-	{ "?",   "Help: keys, mouse, Ghostty setup" },
+	{ "U I", "Unicode keyboard / Input method" },
 	{ "D",   "Detach (leave it all running)" },
 	{ "M T", "Mark (copy mode) / Transfer the mark" },
 	{ "H S", "Hide window / Switch window (a list)" },
-	{ "B",   "Broadcast typing to every window" },
-	{ "Q",   "Quit goblin-view (close everything)" },
-	{ NULL,  NULL },
-	{ "",    "Move:   R M, then arrows (Shift=5)" },
-	{ "",    "Resize: R R, then arrows, Enter" },
-	{ "",    "Mouse:  drag frame=move, corner=resize" },
-	{ NULL,  NULL },
-	{ "Esc", "Cancel" },
+	{ "Q",   "Quit odin-seat (close everything)" },
+	{ "",    "Halves: R + arrow, or \xe2\x86\x90\xe2\x86\x91\xe2\x86\x93\xe2\x86\x92 on a frame" },
+	{ "",    "Move/resize: R M or R R, arrows, Enter" },
+	{ "",    "Mouse: drag frame=move, corner=resize" },
+	{ "?",   "Help: keys, mouse  (Esc cancels)" },
 };
 
 #define MENU_NITEMS	((unsigned)(sizeof menu_items / sizeof menu_items[0]))
@@ -81,6 +84,8 @@ put(struct dv_cell *desk, unsigned W, unsigned H, unsigned x, unsigned y,
 	c->attr = attr;
 	c->ustyle = 0;
 	c->ucolor = DV_COLOR_DEFAULT;
+	c->font = 0;			/* not the program's, whatever it covers */
+	c->depth = 0;
 }
 
 static uint32_t
@@ -171,7 +176,7 @@ paint_box(struct dv_cell *desk, unsigned W, unsigned H)
 	put(desk, W, H, x0, y0 + MENU_H - 1, 0x255A, MENU_BORDER, MENU_BG, 0);
 	put(desk, W, H, x0 + DV_MENU_W - 1, y0 + MENU_H - 1, 0x255D,
 	    MENU_BORDER, MENU_BG, 0);
-	text(desk, W, H, x0 + 2, y0, " GoblinView ", MENU_BORDER, MENU_BG,
+	text(desk, W, H, x0 + 2, y0, " Odin Seat ", MENU_BORDER, MENU_BG,
 	    DV_ATTR_BOLD, DV_MENU_W - 4);
 
 	for (i = 0; i < MENU_NITEMS; i++) {
@@ -202,7 +207,8 @@ paint_bar(struct dv_cell *desk, unsigned W, unsigned H)
 	    DV_ATTR_BOLD, W);
 	text(desk, W, H, n, H - 1,
 	    "  \001O\002pen \001C\002lose \001Z\002oom \001R\002earrange"
-	    " \0011-9\002 \001D\002etach \001Q\002uit  (R M/R R + arrows,"
+	    " \001E\002 split \001K\002 kill"
+	    " \001F\002 redraw \0011-9\002 \001D\002etach \001Q\002uit  (R M/R R + arrows,"
 	    " or drag frame)", MENU_FG, MENU_BG, 0, W > n ? W - n : 0);
 }
 
@@ -291,19 +297,17 @@ switch_find(const struct dv_session *s, unsigned id)
 	return (nullptr);
 }
 
-unsigned
-dv_switch_list(const struct dv_session *s, unsigned *ids, unsigned max)
+std::vector<unsigned>
+dv_switch_list(const struct dv_session *s)
 {
 	const struct dv_window	*w;
-	unsigned		 n = 0;
+	std::vector<unsigned>	 ids;
 
 	TAILQ_FOREACH(w, &s->desktop.windows, entry) {
-		if (n >= max)
-			break;
 		if (switch_match(w, s->switch_filter))
-			ids[n++] = w->id;
+			ids.push_back(w->id);
 	}
-	return (n);
+	return (ids);
 }
 
 /*
@@ -315,15 +319,17 @@ void
 dv_switch_paint(struct dv_cell *desk, unsigned W, unsigned H,
     const struct dv_session *s)
 {
-	unsigned	 ids[256], n = dv_switch_list(s, ids, 256);
-	unsigned	 bw = W < 64 ? W : 64, bh, x0, y0, x, y, i, first = 0;
+	auto		 ids = dv_switch_list(s);
+	size_t		 n = ids.size(), first = 0;
+	size_t		 selected = n == 0 ? 0 : std::min(s->switch_sel, n - 1);
+	unsigned	 bw = W < 64 ? W : 64, bh, x0, y0, x, y, i;
 	unsigned	 rows_avail = H > 6 ? H - 6 : 1, shown;
 
 	if (W < 20 || H < 6)
 		return;
-	shown = n < rows_avail ? n : rows_avail;
-	if ((unsigned)s->switch_sel >= first + shown && shown > 0)
-		first = (unsigned)s->switch_sel - shown + 1;
+	shown = n < rows_avail ? (unsigned)n : rows_avail;
+	if (selected >= shown && shown > 0)
+		first = selected - shown + 1;
 	bh = shown + 4;
 	x0 = (W - bw) / 2;
 	y0 = (H - bh) / 2;
@@ -347,15 +353,31 @@ dv_switch_paint(struct dv_cell *desk, unsigned W, unsigned H,
 	for (i = 0; i < shown; i++) {
 		const struct dv_window	*w = switch_find(s, ids[first + i]);
 		char			 line[160];
-		uint8_t			 attr = (first + i == (unsigned)s->switch_sel) ?
+		uint8_t			 attr = (first + i == selected) ?
 					    DV_ATTR_REV : 0;
 
 		if (w == nullptr)
 			continue;
-		snprintf(line, sizeof line, " %2u  %-24.24s %-14.14s %ux%u%s%s",
-		    w->id, w->title[0] ? w->title : w->cmd, w->cmd,
-		    w->geom.cols, w->geom.rows, w->hidden ? "  hidden" : "",
-		    s->desktop.focused == w ? "  *" : "");
+		{
+			/* What its program says it is doing (OSC 7501). */
+			struct dv_pstatus_view	 v;
+			char			 st[32] = "";
+
+			if (dv_pstatus_view_of(w, &v)) {
+				const char	*word = v.state == DV_PS_WORKING ? "working" :
+				    v.state == DV_PS_DONE ? "done" :
+				    v.state == DV_PS_ERROR ? "failed" : "needs you";
+
+				if (v.state == DV_PS_WORKING && v.progress >= 0)
+					snprintf(st, sizeof st, "  %d%%", v.progress);
+				else
+					snprintf(st, sizeof st, "  %s", word);
+			}
+			snprintf(line, sizeof line, " %2u  %-24.24s %-14.14s %ux%u%s%s%s",
+			    w->id, w->title[0] ? w->title : w->cmd, w->cmd,
+			    w->geom.cols, w->geom.rows, w->hidden ? "  hidden" : "",
+			    s->desktop.focused == w ? "  *" : "", st);
+		}
 		for (x = 1; x + 1 < bw; x++)
 			put(desk, W, H, x0 + x, y0 + 1 + i, U' ', MENU_FG, MENU_BG, attr);
 		text(desk, W, H, x0 + 1, y0 + 1 + i, line, MENU_FG, MENU_BG, attr, bw - 2);
@@ -395,17 +417,21 @@ dv_help_paint(struct dv_cell *desk, unsigned W, unsigned H)
 	    "or press Ctrl-\\.  Then a letter; Esc cancels.",
 	    "",
 	    "O open   C close   Z zoom   R rearrange   1-9 select   D detach   Q quit",
+	    "R then an arrow: to that half of the screen (also the arrows on a frame).",
+	    "X selects a window (also the dot on its frame), A all or none.  B types to",
+	    "the selected; L lays them out: F full  G grid  H rows  V columns  2 two.",
+	    "E then R/B: split right/below   K: force-kill a hung window (asks)",
 	    "U unicode keyboard   I input method (pinyin, wubi, zhuyin, romaji...)",
+	    "F screen redraw: repaint this terminal's text and images from scratch.",
 	    "Move: R M, then arrows (Shift = 5), Enter.   Resize: R R, arrows, Enter.",
 	    "Mouse: drag a frame to move, its corner to resize, the body to select",
 	    "text (copied on release).  Double-click a title to rename the window.",
-	    "",
 	    "Ghostty: in ~/.config/ghostty/config add",
 	    "    macos-option-as-alt = true",
 	    "so an Option tap opens the menu (Cmd+Shift+, reloads the config).",
-	    "Images: programs may draw with kitty graphics or sixel when the",
-	    "terminal you attach from speaks kitty graphics (Ghostty, kitty).",
-	    "Elsewhere goblin-view is text-only and tells programs so.",
+	    "Images: programs may draw with kitty graphics, vectors or sixel. Each",
+	    "terminal is shown them as it can: kitty graphics, sixel, or failing",
+	    "both as coloured half-block cells (config: cell-pictures = no).",
 	    "",
 	    "Any key closes this help.",
 	};
@@ -441,7 +467,7 @@ dv_help_paint(struct dv_cell *desk, unsigned W, unsigned H)
 	put(desk, W, H, x0, y0 + bh - 1, 0x255A, MENU_BORDER, MENU_BG, 0);
 	put(desk, W, H, x0 + bw - 1, y0 + bh - 1, 0x255D, MENU_BORDER, MENU_BG,
 	    0);
-	text(desk, W, H, x0 + 2, y0, " GoblinView help ", MENU_BORDER, MENU_BG,
+	text(desk, W, H, x0 + 2, y0, " Odin Seat help ", MENU_BORDER, MENU_BG,
 	    DV_ATTR_BOLD, bw - 3);
 	for (i = 0; i < n && i + 2 < bh; i++)
 		text(desk, W, H, x0 + 2, y0 + 1 + i, lines[i], MENU_FG, MENU_BG,

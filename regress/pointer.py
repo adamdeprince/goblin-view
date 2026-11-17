@@ -2,7 +2,7 @@
 """Real PTY client/server pointer routing, capture and image-tile regression."""
 import fcntl,os,pty,re,select,signal,struct,subprocess,sys,tempfile,termios,time
 from pathlib import Path
-GV=os.environ.get('GV',str(Path(__file__).resolve().parents[1]/'goblin-view'))
+GV=os.environ.get('GV',str(Path(__file__).resolve().parents[1]/'odin-seat'))
 LABEL='pointer-'+str(os.getpid())
 ESC=b'\x1b';ST=ESC+b'\\';PREFIX=ESC+b']777;goblin-pointer;v=1:op='
 def frame(op,**kw):return PREFIX+op.encode()+b''.join(b':'+k.encode()+b'='+str(v).encode() for k,v in kw.items())+ST
@@ -29,7 +29,7 @@ while True:
  if d==b'E':os.write(1,b'\\x1b]777;goblin-pointer;v=1:op=mode:mode=1\\x1b\\\\ENHANCED_READY')
 ''')
     master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',30,100,1000,600))
-    env=dict(os.environ,TERM='xterm-kitty',GOBLIN_VIEW_KITTY_MEDIUM='direct',PYENV_REHASH_TIMEOUT='1')
+    env=dict(os.environ,TERM='xterm-kitty',ODIN_SEAT_KITTY_MEDIUM='direct',PYENV_REHASH_TIMEOUT='1')
     child=subprocess.Popen([GV,'-L',LABEL,'new-session','--',sys.executable,str(child_script),str(log)],stdin=slave,stdout=slave,stderr=slave,env=env)
     pending=bytearray();seen=set()
     def pump(seconds=.1):

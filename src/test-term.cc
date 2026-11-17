@@ -1,4 +1,5 @@
 #include "dv.hpp"
+#include "pstatus.hpp"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -189,7 +190,7 @@ test_xfer(void)
 		fail("mkdtemp");
 		return;
 	}
-	setenv("GOBLIN_VIEW_DOWNLOAD_DIR", dir, 1);
+	setenv("ODIN_SEAT_DOWNLOAD_DIR", dir, 1);
 	memset(&ses, 0, sizeof ses);
 	TAILQ_INIT(&ses.desktop.windows);
 	fresh(&w, 40, 10);
@@ -768,7 +769,12 @@ test_xtgettcap(void)
 		fail("pipe");
 	fcntl(pfd[0], F_SETFL, O_NONBLOCK);
 	w.pty_fd = pfd[1];
-	unsetenv("GOBLIN_VIEW_TERM");
+	unsetenv("ODIN_SEAT_TERM");
+	put(&w, "\033[>q");
+	rn = read(pfd[0], rb, sizeof rb - 1);
+	rb[rn > 0 ? rn : 0] = '\0';
+	if (strcmp(rb, "\033P>|OdinSeat " DV_VERSION "\033\\") != 0)
+		fail("XTVERSION reports the portable Odin Seat identity");
 	put(&w, "\033P+q5463;524742;5375\033\\");		/* Tc RGB Su */
 	rn = read(pfd[0], rb, sizeof rb - 1);
 	rb[rn > 0 ? rn : 0] = '\0';
@@ -962,9 +968,221 @@ test_dynamic_image_memory(void)
 	dv_screen_free(&w.screen);
 }
 
+static void
+test_tiny_screen_resize(void)
+{
+	struct dv_window w;
+	fresh(&w, 80, 24);
+	for (unsigned cols : {1u, 2u, 1u, 80u}) {
+		for (unsigned rows : {1u, 2u, 1u, 24u}) {
+			/* Resize both screens with saved cursors beyond the new edge. */
+			put(&w, "\033[999;999H\0337\033[?1049h\033[999;999H\0337");
+			dv_screen_resize(&w.screen, cols, rows);
+			put(&w, "\0338");
+			if (w.screen.cc >= cols || w.screen.cr >= rows ||
+			    w.screen.mt != 0 || w.screen.mb != rows - 1)
+				fail("tiny alternate screen clamps cursor and scroll region");
+			put(&w, "\033[?1049l\0338");
+			if (w.screen.cc >= cols || w.screen.cr >= rows)
+				fail("tiny primary screen clamps the saved cursor");
+			/* Wrap, scroll both ways, edit lines/cells, and print wide text. */
+			put(&w, "ab\r\ncd\033[S\033[T\033[L\033[M\033[@\033[P"
+			    "\xe4\xb8\xad\033[2J\033[HX\033[H");
+			if (at(&w, 0, 0) != 'X' || w.screen.cc != 0 || w.screen.cr != 0)
+				fail("tiny screen stays writable after scrolling and editing");
+		}
+	}
+	dv_screen_resize(&w.screen, 0, 0);
+	if (w.screen.cols != 1 || w.screen.rows != 1)
+		fail("zero screen dimensions clamp to 1x1");
+	dv_screen_free(&w.screen);
+}
+
+
+/* ---- program status (OSC 7501) and ConEmu's OSC 9 ---- */
+
+static void
+test_pstatus(void)
+{
+	struct dv_session		 ses;
+	struct dv_window		 w;
+	const struct dv_pstatus_rec	*r;
+	struct dv_pstatus_view		 v;
+	int				 pfd[2];
+	char				 big[9000];
+	std::string			 longid, report;
+
+	memset(&ses, 0, sizeof ses);
+	TAILQ_INIT(&ses.desktop.windows);
+	fresh(&w, 40, 10);
+	w.id = 7;
+	dv_strlcpy(w.cmd, "bash", sizeof w.cmd);
+	dv_strlcpy(w.title, "bash", sizeof w.title);
+	w.session = &ses;
+	TAILQ_INSERT_TAIL(&ses.desktop.windows, &w, entry);
+	if (pipe(pfd) != 0)
+		fail("pipe");
+	fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+	w.pty_fd = pfd[1];
+
+	/* The feature query is answered with the states and kinds. */
+	put(&w, "\033]7501;?\033\\");
+	if (strstr(drain(pfd[0]), "\033]7501;?:states=idle,working,done,"
+	    "blocked,error:kinds=permission,question,auth\033\\") == nullptr)
+		fail("OSC 7501 ? is answered");
+
+	/* A report makes the root record; base64 text is decoded. */
+	put(&w, "\033]7501;state=working:app=rsync:progress=40:msg=U3luY2luZw\033\\");
+	r = dv_pstatus_find(&w, "");
+	if (r == nullptr || r->state != DV_PS_WORKING || r->progress != 40 ||
+	    r->app != "rsync" || r->msg != "Syncing")
+		fail("a working report is kept, unpadded base64 decoded");
+	if (!dv_pstatus_view_of(&w, &v) || v.state != DV_PS_WORKING ||
+	    v.progress != 40 || v.text != "rsync: Syncing")
+		fail("the frame shows the working record");
+
+	/* A report replaces its record whole: no carried-over keys. */
+	put(&w, "\033]7501;state=working\007");
+	r = dv_pstatus_find(&w, "");
+	if (r == nullptr || !r->app.empty() || r->progress != -1 || !r->msg.empty())
+		fail("a report replaces its record completely");
+
+	/* Malformed pairs are skipped, the rest applies; whitespace trimmed. */
+	put(&w, "\033]7501; state = blocked :kind=question:bogus:K=x:app=a b:progress=101\033\\");
+	r = dv_pstatus_find(&w, "");
+	if (r == nullptr || r->state != DV_PS_BLOCKED ||
+	    r->kind != DV_PS_KIND_QUESTION || !r->app.empty() || r->progress != -1)
+		fail("malformed pairs skipped, out of range progress absent");
+
+	/* Unknown state, a bad id, bad base64, a control: all ignored whole. */
+	put(&w, "\033]7501;state=sleeping:id=x\033\\");
+	put(&w, "\033]7501;state=done:id=a//b\033\\");
+	put(&w, "\033]7501;state=done:id=c:msg=QUJ=D\033\\");	/* not base64 */
+	put(&w, "\033]7501;state=done:id=d:msg=YQpi\033\\");	/* "a\nb" */
+	put(&w, "\033]7501;state=done:id=e:msg=wIA=\033\\");	/* not UTF-8 */
+	put(&w, "\033]7501;app=x\033\\");			/* no state */
+	if (dv_pstatus_count(&w) != 1)
+		fail("refused reports leave nothing behind");
+
+	/* Children; app is inherited for display; the hierarchy clears. */
+	put(&w, "\033]7501;state=working:app=deploy\033\\");
+	put(&w, "\033]7501;state=working:id=us-east:progress=10\033\\");
+	put(&w, "\033]7501;state=blocked:id=us-east/db:kind=permission\033\\");
+	put(&w, "\033]7501;state=done:id=eu-west\033\\");
+	if (dv_pstatus_count(&w) != 4)
+		fail("records per id");
+	if (!dv_pstatus_view_of(&w, &v) || v.state != DV_PS_BLOCKED ||
+	    v.kind != DV_PS_KIND_PERMISSION || v.text != "deploy" || v.count != 1)
+		fail("blocked is the most urgent, its app inherited");
+	put(&w, "\033]7501;state=clear:id=us-east\033\\");
+	if (dv_pstatus_count(&w) != 2 || dv_pstatus_find(&w, "us-east/db") != nullptr)
+		fail("clear removes the record and those beneath it");
+
+	/* A prompt ends working, blocked and idle; done stays. */
+	put(&w, "\033]7501;state=idle:id=i\033\\");
+	put(&w, "\033]133;A\033\\");
+	if (dv_pstatus_count(&w) != 1 || dv_pstatus_find(&w, "eu-west") == nullptr)
+		fail("a new prompt drops working, blocked and idle");
+	/* Done stays until the user comes back to the window. */
+	dv_pstatus_focus(&ses);
+	if (dv_pstatus_count(&w) != 1)
+		fail("an unfocused window keeps its results");
+	ses.desktop.focused = &w;
+	dv_pstatus_focus(&ses);
+	if (dv_pstatus_count(&w) != 0)
+		fail("focusing the window lets its results go");
+	put(&w, "\033]7501;state=error:msg=ZmFpbGVk\033\\");
+	dv_pstatus_focus(&ses);
+	if (dv_pstatus_count(&w) != 1)
+		fail("a result arriving in the focused window stays");
+	dv_pstatus_key(&w);
+	if (dv_pstatus_count(&w) != 0)
+		fail("a key in it lets it go");
+
+	/* None of the spec's size limits: long ids, many records, long msg. */
+	for (int i = 0; i < 12; i++)
+		longid += (i ? "/" : "") + std::string(40, 'a' + i);
+	put(&w, ("\033]7501;state=working:id=" + longid + "\033\\").c_str());
+	for (int i = 0; i < 300; i++)
+		put(&w, ("\033]7501;state=working:id=r" + std::to_string(i) +
+		    "\033\\").c_str());
+	if (dv_pstatus_find(&w, longid.c_str()) == nullptr ||
+	    dv_pstatus_count(&w) != 301)
+		fail("no cap on id length, depth or record count");
+	for (size_t i = 0; i + 4 < sizeof big; i += 4)	/* "abc" again and again */
+		memcpy(big + i, "YWJj", 4);
+	big[8996] = '\0';
+	report = std::string("\033]7501;state=done:id=big:msg=") + big + "\033\\";
+	put(&w, report.c_str());
+	r = dv_pstatus_find(&w, "big");
+	if (r == nullptr || r->msg.size() != 8996 / 4 * 3)
+		fail("a msg past 2048 bytes is kept");
+	/* RIS removes every record. */
+	put(&w, "\033c");
+	if (dv_pstatus_count(&w) != 0)
+		fail("RIS removes every record");
+
+	/* OSC 9;4 is progress, mapped to the root until a real report. */
+	w.host_out.len = 0;
+	put(&w, "\033]9;4;1;55\033\\");
+	r = dv_pstatus_find(&w, "");
+	if (r == nullptr || r->state != DV_PS_WORKING || r->progress != 55 || !r->osc9)
+		fail("OSC 9;4;1 maps to a working root record");
+	if (host_has(&w, "99;"))
+		fail("OSC 9;4 is not a notification");
+	put(&w, "\033]9;4;2\033\\");
+	r = dv_pstatus_find(&w, "");
+	if (r == nullptr || r->state != DV_PS_ERROR)
+		fail("OSC 9;4;2 is an error");
+	put(&w, "\033]9;4\033\\");
+	if (dv_pstatus_count(&w) != 0)
+		fail("the bare OSC 9;4 clears progress");
+	put(&w, "\033]7501;state=idle:id=x\033\\");
+	put(&w, "\033]9;4;3\033\\");
+	if (dv_pstatus_find(&w, "") != nullptr)
+		fail("after a real report OSC 9;4 is not mapped");
+	put(&w, "\033c");
+
+	/* ConEmu's other sub-commands. */
+	put(&w, "\033]9;3;\"Build log\"\033\\");
+	if (strcmp(w.title, "Build log") != 0)
+		fail("OSC 9;3 sets the title, quotes removed");
+	put(&w, "\033]9;3;\033\\");
+	if (strcmp(w.title, "bash") != 0)
+		fail("an empty OSC 9;3 restores the default title");
+	put(&w, "\033]9;9;\"/tmp\"\033\\");
+	if (strcmp(w.cwd, "/tmp") != 0)
+		fail("OSC 9;9 records the working directory");
+	put(&w, "\033]7;file://host/usr/local%20dir\033\\");
+	if (strcmp(w.cwd, "/usr/local dir") != 0)
+		fail("OSC 7 records the working directory, percent-decoded");
+	put(&w, "\033]7501;state=working\033\\");
+	put(&w, "\033]9;12\033\\");
+	if (dv_pstatus_count(&w) != 0)
+		fail("OSC 9;12 marks a prompt like OSC 133;A");
+	put(&w, "\033]9;1;500\033\\\033]9;11;hello\033\\\033]9;6;x\033\\");
+	if (strcmp(w.title, "bash") != 0 || dv_pstatus_count(&w) != 0)
+		fail("unimplemented sub-commands and comments do nothing");
+	put(&w, "\033]9;3;Title that is longer than the frame could ever hold "
+	    "and then some \xe4\xb8\xad\xe4\xb8\xad\033\\");
+	if (strlen(w.title) >= sizeof w.title ||
+	    ((unsigned char)w.title[strlen(w.title) - 1] & 0xc0) == 0xc0)
+		fail("a long title is cut on a character boundary");
+
+	close(pfd[0]);
+	close(pfd[1]);
+	w.pty_fd = -1;
+	dv_pstatus_close(&w);
+	dv_screen_free(&w.screen);
+	dv_buf_free(&w.host_out);
+	dv_buf_free(&w.cap);
+}
+
 int
 main(void)
 {
+	test_pstatus();
+	test_tiny_screen_resize();
 	test_many_images();
 	test_dynamic_image_memory();
 	struct dv_window	w;
@@ -1030,6 +1248,72 @@ main(void)
 	if (w.screen.alpha != 100 || w.screen.fg_br != 100 || w.screen.bg_br != 100 ||
 	    w.screen.fg_gamut != 0 || w.screen.bg_gamut != 0)
 		fail("SGR 0 resets alpha, brightness and gamut");
+	/* Deep colours: 38:0:id:r:g:b, sixteen bits a channel, kept exactly. */
+	put(&w, "\033[0m\033[38:0:1:65535:32768:1;48:0:0:257:0:65535;4;58:0:2:128:129:40000mD");
+	c = dv_screen_at(&w.screen, w.screen.cc - 1, w.screen.cr);
+	if (c == nullptr || c->fg != DV_RGB(255, 128, 0) || c->fg_gamut != 1 ||
+	    dv_deep_chan(c->fg, c->fg_x, 0) != 65535 ||
+	    dv_deep_chan(c->fg, c->fg_x, 1) != 32768 ||
+	    dv_deep_chan(c->fg, c->fg_x, 2) != 1)
+		fail("SGR 38:0 keeps all sixteen bits and the gamut");
+	if (c == nullptr || c->bg != DV_RGB(1, 0, 255) || c->bg_gamut != 0 ||
+	    dv_deep_chan(c->bg, c->bg_x, 0) != 257 ||
+	    dv_deep_chan(c->bg, c->bg_x, 2) != 65535)
+		fail("SGR 48:0: 257 is an eight-bit 1 exactly");
+	if (c == nullptr || dv_deep_gamut(c->u_x) != 2 ||
+	    dv_deep_chan(c->ucolor, c->u_x, 0) != 128 ||
+	    dv_deep_chan(c->ucolor, c->u_x, 1) != 129 ||
+	    dv_deep_chan(c->ucolor, c->u_x, 2) != 40000)
+		fail("SGR 58:0 keeps its gamut, and values either side of a half step");
+	{
+		/* Every sixteen-bit value comes back from its cell. */
+		int	bad = 0;
+
+		for (unsigned v = 0; v <= 65535; v++) {
+			uint32_t	rgb, x = dv_deep_make(v, 65535 - v, v / 2, 0, &rgb);
+
+			if (dv_deep_chan(rgb, x, 0) != v ||
+			    dv_deep_chan(rgb, x, 1) != 65535 - v ||
+			    dv_deep_chan(rgb, x, 2) != v / 2)
+				bad = 1;
+		}
+		if (bad)
+			fail("dv_deep_make round-trips every value");
+	}
+	{
+		/* The cell codec (the state handover) carries the deep words. */
+		struct dv_buf	enc;
+		struct dv_cell	back;
+
+		memset(&enc, 0, sizeof enc);
+		memset(&back, 0, sizeof back);
+		dv_cells_encode(&enc, c, 1);
+		dv_buf_append(&enc, "", 1);
+		if (dv_cells_decode((const char *)enc.data, &back, 1) != 1 ||
+		    back.fg_x != c->fg_x || back.bg_x != c->bg_x || back.u_x != c->u_x)
+			fail("deep colours survive the cell codec");
+		dv_buf_free(&enc);
+	}
+	/* Malformed groups change nothing; what follows them still applies. */
+	put(&w, "\033[38:0:0:1:2m");
+	put(&w, "\033[38:0:0:70000:0:0m");
+	put(&w, "\033[38:0::65535:0:0;1m");
+	if (w.screen.fg != DV_RGB(255, 128, 0) || w.screen.fg_x == 0 ||
+	    !(w.screen.attr & DV_ATTR_BOLD))
+		fail("a malformed 38:0 group is ignored, the rest applies");
+	/* Any ordinary colour of the same kind replaces a deep one. */
+	put(&w, "\033[38;2;1;2;3;49;59m");
+	if (w.screen.fg_x != 0 || w.screen.bg_x != 0 || w.screen.u_x != 0 ||
+	    w.screen.fg_gamut != 0)
+		fail("38;2, 49 and 59 replace deep colours");
+	put(&w, "\033[38:0:1:1:2:3m\0337\033[0m\0338");
+	if (w.screen.fg_x == 0 || w.screen.fg_gamut != 1)
+		fail("DECSC/DECRC keep the deep pen");
+	put(&w, "\033[0m");
+	if (w.screen.fg_x != 0)
+		fail("SGR 0 clears a deep colour");
+	put(&w, "\033[2J");
+
 	put(&w, "\033[56:250m\033[56;250m");
 	if (w.screen.fg_br != 100)
 		fail("SGR 56 without a colon subparameter resets brightness");
@@ -1212,6 +1496,20 @@ main(void)
 		if (w.screen.pal.idx[1] != (DV_COLOR_RGB | 0xff0000) || !w.screen.pal.set[2] ||
 		    !w.screen.pal.bgset)
 			fail("OSC 30101 restores the pushed colours");
+		/* The stack has no maximum depth: twenty pushes, twenty pops. */
+		for (int k = 0; k < 20; k++) {
+			char	set[64];
+
+			snprintf(set, sizeof set, "\033]30001\033\\\033]4;3;rgb:%02x/00/00\033\\", k);
+			put(&w, set);
+		}
+		for (int k = 19; k >= 0; k--) {
+			if (w.screen.pal.idx[3] != (DV_COLOR_RGB | ((uint32_t)k << 16)))
+				fail("each pushed level comes back in turn");
+			put(&w, "\033]30101\033\\");
+		}
+		if (w.screen.pal.idx[1] != (DV_COLOR_RGB | 0xff0000))
+			fail("the bottom of a deep stack is the first push");
 		put(&w, "\033]104\033\\\033]110\033\\\033]111\033\\");
 		if (w.screen.pal.any)
 			fail("resetting everything leaves no override");
@@ -1249,8 +1547,8 @@ main(void)
 		    ses.routes[1].win != 7)
 			fail("OSC 5522 routes by id");
 		put(&w, "\033]99;i=n9:d=0:a=focus;hello\033\\");
-		if (ses.routes[2].osc != 99 || strcmp(ses.routes[2].id, "n9") != 0)
-			fail("OSC 99 routes by i=");
+        if (!host_has(&w, ".n.n9:") || !host_has(&w, ":r=odin-seat/"))
+            fail("OSC 99 carries a scoped id and return route");
 		put(&w, "\033]5522;type=read:id=q1;dGV4dA==\033\\");
 		if (ses.routes[3].osc != 0 || ses.routes[1].seq != ses.route_seq)
 			fail("a repeated id refreshes its route rather than adding one");
@@ -1513,11 +1811,14 @@ main(void)
 		if (cc->ch != DV_STEXT_MARK || cc->irow != 1 || cc->icol != 3)
 			fail("the run fills a 4x2 rectangle of cells");
 	}
-	if (!w.screen.stext[0].used || w.screen.stext[0].s != 2 ||
-	    w.screen.stext[0].cols != 4 || w.screen.stext[0].rows != 2 ||
-	    w.screen.stext[0].len != 2 ||
-	    memcmp(w.screen.stext[0].text, "Hi", 2) != 0)
-		fail("the run records its scale, footprint and text");
+	{
+		const struct dv_stext	*run = w.screen.stexts == nullptr ? nullptr :
+		    &w.screen.stexts->at(dv_screen_at(&w.screen, 0, 0)->fg);
+
+		if (run == nullptr || run->s != 2 || run->cols != 4 ||
+		    run->rows != 2 || run->text != "Hi")
+			fail("the run records its scale, footprint and text");
+	}
 	/* An explicit width: w=3 at scale 2 is six columns. */
 	put(&w, "\033[3;1H\033]66;w=3:s=2;X\a");
 	if (w.screen.cc != 6)
@@ -1528,13 +1829,13 @@ main(void)
 	if (w.screen.cc != 3)
 		fail("a scale-3 run advances the cursor three columns");
 	put(&w, "\033c");			/* RIS clears the runs */
-	if (w.screen.stext[0].used)
+	if (w.screen.stexts != nullptr)
 		fail("RIS clears scaled-text runs");
 	dv_screen_free(&w.screen);
 	dv_buf_free(&w.cap);
 
 	/*
-	 * Outgoing transmission medium is tunable (GOBLIN_VIEW_KITTY_MEDIUM)
+	 * Outgoing transmission medium is tunable (ODIN_SEAT_KITTY_MEDIUM)
 	 * and defaults to shared memory; direct, temp file and file also
 	 * work. The image here is a 1x1 RGB pixel "ABC".
 	 */
@@ -1550,7 +1851,7 @@ main(void)
 		size_t		nn;
 
 		/* Default: shared memory. Verify the shm holds "ABC". */
-		unsetenv("GOBLIN_VIEW_KITTY_MEDIUM");
+		unsetenv("ODIN_SEAT_KITTY_MEDIUM");
 		memset(&tb, 0, sizeof tb);
 		dv_kitty_transmit(&w, p, &tb);
 		if (memmem(tb.data, tb.len, "t=s,", 4) == NULL)
@@ -1581,7 +1882,7 @@ main(void)
 		dv_buf_free(&tb);
 
 		/* Direct: inline base64, no medium key. */
-		setenv("GOBLIN_VIEW_KITTY_MEDIUM", "direct", 1);
+		setenv("ODIN_SEAT_KITTY_MEDIUM", "direct", 1);
 		memset(&tb, 0, sizeof tb);
 		dv_kitty_transmit(&w, p, &tb);
 		if (memmem(tb.data, tb.len, "t=s", 3) != NULL ||
@@ -1593,7 +1894,7 @@ main(void)
 		dv_buf_free(&tb);
 
 		/* Temp file: t=t, and the file exists (host would delete it). */
-		setenv("GOBLIN_VIEW_KITTY_MEDIUM", "tempfile", 1);
+		setenv("ODIN_SEAT_KITTY_MEDIUM", "tempfile", 1);
 		memset(&tb, 0, sizeof tb);
 		dv_kitty_transmit(&w, p, &tb);
 		if (memmem(tb.data, tb.len, "t=t,", 4) == NULL)
@@ -1611,7 +1912,7 @@ main(void)
 		dv_buf_free(&tb);
 
 		/* File: t=f. */
-		setenv("GOBLIN_VIEW_KITTY_MEDIUM", "file", 1);
+		setenv("ODIN_SEAT_KITTY_MEDIUM", "file", 1);
 		memset(&tb, 0, sizeof tb);
 		dv_kitty_transmit(&w, p, &tb);
 		if (memmem(tb.data, tb.len, "t=f,", 4) == NULL)
@@ -1622,7 +1923,7 @@ main(void)
 			unlink(nm);		/* we would otherwise defer this */
 		}
 		dv_buf_free(&tb);
-		unsetenv("GOBLIN_VIEW_KITTY_MEDIUM");
+		unsetenv("ODIN_SEAT_KITTY_MEDIUM");
 	}
 	dv_screen_free(&w.screen);
 	dv_kitty_free(&w);
@@ -1728,6 +2029,125 @@ main(void)
 	if (!w.screen.app_cursor || w.screen.wrap || !w.screen.bracketed ||
 	    w.screen.mouse_sgr != 2)
 		fail("XTRESTORE with no parameter restores every saved mode");
+	dv_screen_free(&w.screen);
+	dv_buf_free(&w.cap);
+
+	/*
+	 * DECRQM says which private modes are kept here, and how each stands,
+	 * so a program learns it may use synchronized output and pixel mouse
+	 * reports. A synchronized update (mode 2026) is one frame: the parser
+	 * stops where it ends, so what follows is not shown with it.
+	 */
+	fresh(&w, 8, 3);
+	{
+		int	pfd[2];
+		char	rb[128];
+		ssize_t	rn;
+
+		if (pipe(pfd) != 0)
+			fail("pipe");
+		fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+		w.pty_fd = pfd[1];
+		put(&w, "\033[?2026$p\033[?1016$p\033[?9999$p");
+		rn = read(pfd[0], rb, sizeof rb - 1);
+		rb[rn > 0 ? rn : 0] = '\0';
+		if (strcmp(rb, "\033[?2026;2$y\033[?1016;2$y\033[?9999;0$y") != 0)
+			fail("DECRQM reports a kept mode reset and an unknown one unrecognised");
+		put(&w, "\033[?2026h\033[?1016h\033[?2026$p\033[?1016$p");
+		rn = read(pfd[0], rb, sizeof rb - 1);
+		rb[rn > 0 ? rn : 0] = '\0';
+		if (!w.screen.sync || strcmp(rb, "\033[?2026;1$y\033[?1016;1$y") != 0)
+			fail("DECRQM reports a mode that is set");
+		close(pfd[0]);
+		close(pfd[1]);
+		w.pty_fd = -1;
+	}
+	{
+		const char	*upd = "ab\033[?2026lcd";
+		int		 ended = 0;
+		size_t		 used = dv_vt_write_frame(&w, upd, strlen(upd), &ended);
+
+		if (used != 10 || !ended || w.screen.sync)
+			fail("the parser stops where a synchronized update ends");
+		if (dv_screen_at(&w.screen, 1, 0)->ch != 'b' ||
+		    dv_screen_at(&w.screen, 2, 0)->ch == 'c')
+			fail("what follows an update is not drawn with it");
+		used = dv_vt_write_frame(&w, upd + used, strlen(upd) - used, &ended);
+		if (used != 2 || ended || dv_screen_at(&w.screen, 2, 0)->ch != 'c')
+			fail("the rest is drawn when it is written on");
+		put(&w, "\033[?2026h");
+		used = dv_vt_write_frame(&w, "x\033[?2026l", 9, &ended);
+		if (used != 9 || !ended)
+			fail("an update ending with the bytes written has ended");
+		used = dv_vt_write_frame(&w, "\033[?2026lz", 9, &ended);
+		if (used != 9 || ended)
+			fail("a reset with no update under way ends none");
+		/* All of it through the plain entry: nothing is left unread. */
+		put(&w, "\033[H\033[?2026hQ\033[?2026lR\033[?2026hS");
+		if (dv_screen_at(&w.screen, 2, 0)->ch != 'S' || !w.screen.sync)
+			fail("dv_vt_write takes every update it is given");
+		put(&w, "\033c");
+		if (w.screen.sync)
+			fail("RIS ends a synchronized update");
+	}
+	dv_screen_free(&w.screen);
+	dv_buf_free(&w.cap);
+	dv_buf_free(&w.pty_out);
+
+	/*
+	 * Sized text: as many runs as the screen's cells name, with the
+	 * fractional scale and alignment a program gave; those drawn over
+	 * are forgotten rather than piling up.
+	 */
+	fresh(&w, 40, 10);
+	for (unsigned i = 0; i < 100; i++) {
+		char	run[64];
+
+		snprintf(run, sizeof run, "\033[%u;%uH\033]66;n=4:d=5:w=2:v=2:h=1;%02u\033\\",
+		    i / 20 + 1, (i % 20) * 2 + 1, i);
+		put(&w, run);
+	}
+	{
+		unsigned	held = 0;
+
+		for (unsigned i = 0; i < 100; i++) {
+			const struct dv_cell	*cell = dv_screen_at(&w.screen,
+			    (i % 20) * 2, i / 20);
+			char			 want[8];
+
+			snprintf(want, sizeof want, "%02u", i);
+			if (cell->ch != DV_STEXT_MARK || w.screen.stexts == nullptr)
+				continue;
+			auto it = w.screen.stexts->find(cell->fg);
+
+			if (it != w.screen.stexts->end() && it->second.text == want &&
+			    it->second.n == 4 && it->second.d == 5 && it->second.v == 2 &&
+			    it->second.h == 1 && it->second.wparam == 2 &&
+			    it->second.cols == 2 && it->second.rows == 1)
+				held++;
+		}
+		if (held != 100)
+			fail("every sized-text run on the screen is kept, with its fraction");
+	}
+	for (unsigned i = 0; i < 5000; i++)
+		put(&w, "\033[H\033]66;n=1:d=2:w=1;x\033\\");
+	if (w.screen.stexts == nullptr || w.screen.stexts->size() > 400)
+		fail("sized-text runs drawn over are forgotten");
+	{
+		const struct dv_cell	*cell = dv_screen_at(&w.screen, 2, 0);
+
+		if (cell->ch != DV_STEXT_MARK || !w.screen.stexts->contains(cell->fg))
+			fail("a sweep keeps the runs the cells still name");
+	}
+	put(&w, "\033[H\033]66;n=9:d=5:v=7;bad\033\\");
+	{
+		const struct dv_cell	*cell = dv_screen_at(&w.screen, 0, 0);
+		auto it = w.screen.stexts->find(cell->fg);
+
+		if (it == w.screen.stexts->end() || it->second.n != 0 ||
+		    it->second.d != 0 || it->second.v != 0 || it->second.cols != 3)
+			fail("a fraction that is not one, and an alignment that is none, are dropped");
+	}
 	dv_screen_free(&w.screen);
 	dv_buf_free(&w.cap);
 

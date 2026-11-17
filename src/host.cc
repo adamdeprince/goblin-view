@@ -89,6 +89,7 @@ void
 dv_host_bootstrap(struct dv_host *h, int in_fd, int out_fd, struct dv_size *sz)
 {
 	long long	deadline = now_ms() + BOOTSTRAP_MS;
+    std::vector<dv_host_ev> pending;
 
 	/*
 	 * Keyboard flags, in-band resize, cell and text-area sizes, then a
@@ -96,7 +97,7 @@ dv_host_bootstrap(struct dv_host *h, int in_fd, int out_fd, struct dv_size *sz)
 	 * graphics answers the query before DA1, one that does not answers
 	 * only DA1, and either way DA1 ends the wait.
 	 */
-	host_write(out_fd, "\033[>27u\033[?2048h\033[16t\033[18t"
+	host_write(out_fd, "\033[>27u\033[?2048h\033[?1004h\033[16t\033[18t"
 	    "\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\033\\\033[>q"
 	    "\033]777;goblin-pointer;v=1:op=query:id=17349522\033\\");
 	host_write(out_fd, dv_silkie_probe());
@@ -141,11 +142,13 @@ dv_host_bootstrap(struct dv_host *h, int in_fd, int out_fd, struct dv_size *sz)
                     h->pointer_caps = pointer.caps;
 				dv_silkie_note(h, h->osc.data, h->osc.len);
 				h->osc.len = 0;
+			} else if (ev.type == DV_HEV_APC) {
+				h->osc.len = 0;		/* nothing has asked yet */
 			}
-			else if (h->npend < sizeof h->pend / sizeof h->pend[0])
-				h->pend[h->npend++] = ev;
+			else pending.push_back(ev);
 		}
 	}
+    dv_buf_append(&h->pending, pending.data(), pending.size() * sizeof(dv_host_ev));
 }
 
 /*
@@ -165,16 +168,17 @@ dv_host_disable(int fd)
 	static const char seq[] =
 	    "\033[0m"
 	    "\033[?25h"
-	    "\033[?1000l\033[?1002l\033[?1003l\033[?1006l"
+	    "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1016l"
 	    "\033]777;goblin-pointer;v=1:op=mode:mode=0\033\\"
 	    "\033]777;caps;v=1:op=reset\033\\"
+	    "\033]7501;state=clear\033\\"	/* the windows' status records */
 	    "\033[?2004l"
 	    "\033[<u"
 	    "\033]72;t=A\033\\"		/* no more drops for us */
 	    "\033[>0;4 q"			/* no extra cursors either */
 	    "\033]22;\033\\"			/* the pointer shape we may have set */
 	    "\033]112\033\\"			/* and the cursor colour */
-	    "\033[?2048l"
+	    "\033[?1004l\033[?2048l"
 	    "\033[2J\033[H"
 	    "\033[?1049l";
 
@@ -691,6 +695,25 @@ host_take(struct dv_host *h, size_t n)
 	host_consume(h, n);
 }
 
+/* Is this graphics reply (ESC _ G keys ; ... ) for a window's vector request? */
+static int
+apc_is_service(const unsigned char *b, size_t end)
+{
+	size_t	i;
+
+	for (i = 3; i + 1 < end && b[i] != ';'; i++) {
+		if (b[i] == 'i' && b[i + 1] == '=' && (i == 3 || b[i - 1] == ',')) {
+			unsigned long long	v = 0;
+
+			for (i += 2; i < end && b[i] >= '0' && b[i] <= '9' &&
+			    v <= DV_VREQ_LAST; i++)
+				v = v * 10 + (b[i] - '0');
+			return (v >= DV_VREQ_FIRST && v <= DV_VREQ_LAST);
+		}
+	}
+	return (0);
+}
+
 /*
  * Parse one CSI / APC / run of bytes from h->buf. Returns 1 and fills
  * ev, 0 if more input is needed, -1 if bytes were swallowed with no
@@ -768,7 +791,7 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 				host_take(h, i + 1);
 				return (-1);
 			}
-			if (dv_escape_limit ? len > dv_escape_limit : (!h->holding && len + 1 >= sizeof h->buf)) {
+			if (dv_escape_limit && len > dv_escape_limit) {
 				host_take(h, 1);
 				return (-1);
 			}
@@ -795,10 +818,20 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 				continue;
 			if (memmem(b, i + 1, ";OK", 3) != NULL)
 				h->gfx = 1;
+			if (apc_is_service(b, i)) {
+				size_t	end = b[i] == 0x07 ? i : i - 1;
+
+				h->osc.len = 0;
+				dv_buf_append(&h->osc, b + 2, end - 2);
+				ev->type = DV_HEV_APC;
+				ev->n = h->osc.len;
+				host_take(h, i + 1);
+				return (1);
+			}
 			host_take(h, i + 1);
 			return (-1);
 		}
-		if (dv_escape_limit ? len > dv_escape_limit : (!h->holding && len + 1 >= sizeof h->buf)) {
+		if (dv_escape_limit && len > dv_escape_limit) {
 			host_take(h, 1);
 			return (-1);
 		}
@@ -850,7 +883,7 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 		}
 	}
 	if (end == 0) {
-		if (dv_csi_limit ? len > dv_csi_limit : (!h->holding && len + 1 >= sizeof h->buf)) {
+		if (dv_csi_limit && len > dv_csi_limit) {
 			host_take(h, 1);
 			return (-1);
 		}
@@ -858,7 +891,11 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 	}
 	final = b[end];
 
-	/* SGR mouse: ESC [ < code ; x ; y (M|m). */
+	/* SGR mouse: ESC [ < code ; x ; y (M|m).
+	 * In pixel mode the coordinates are pixels. kitty, Ghostty and Silkie
+	 * number the top-left pixel 0; xterm numbers it 1. Stored pixels are
+	 * 0-based either way, and the cell is derived from them so the position
+	 * inside the cell is not discarded. */
 	if (b[2] == '<' && (final == 'M' || final == 'm')) {
 		unsigned	m[3] = {0, 0, 0};
 		int		mi = 0;
@@ -874,9 +911,41 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 		}
 		ev->type = DV_HEV_MOUSE;
 		ev->mcode = m[0];
+		ev->mpress = (final == 'M') ? DV_MOUSE_PRESS : DV_MOUSE_RELEASE;
+		ev->mpix = 0;
+		ev->mpx = 0;
+		ev->mpy = 0;
 		ev->mx = m[1];
 		ev->my = m[2];
-		ev->mpress = (final == 'M') ? DV_MOUSE_PRESS : DV_MOUSE_RELEASE;
+		if (h->pixel_mouse) {
+			int		origin = 0;
+			long		px, py;
+			unsigned	cw = h->xpixel ? h->xpixel : DV_DEFAULT_XPIXEL;
+			unsigned	ch = h->ypixel ? h->ypixel : DV_DEFAULT_YPIXEL;
+
+			if (h->name[0] != '\0' &&
+			    !dv_term_is(h->name, "kitty") &&
+			    !dv_term_is(h->name, "ghostty") &&
+			    !dv_term_is(h->name, "silkie") &&
+			    !dv_term_is(h->name, "goblin") &&
+			    dv_term_is(h->name, "xterm"))
+				origin = 1;
+			px = (long)m[1] - origin;
+			py = (long)m[2] - origin;
+			if (px < 0)
+				px = 0;
+			if (py < 0)
+				py = 0;
+			if (px > 10000000)
+				px = 10000000;
+			if (py > 10000000)
+				py = 10000000;
+			ev->mpix = 1;
+			ev->mpx = (int)px;
+			ev->mpy = (int)py;
+			ev->mx = (unsigned)(px / (long)cw) + 1;
+			ev->my = (unsigned)(py / (long)ch) + 1;
+		}
 		host_take(h, end + 1);
 		return (1);
 	}
@@ -887,6 +956,20 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 			h->kbd = 1;
 		if (final == 'q' && b[2] == '>')	/* CSI > 1;2;... SP q */
 			h->mcursors = 1;
+		if (final == 'y' && b[2] == '?') {
+			/* DECRPM: CSI ? Pd ; Ps $ y. Ps 1 or 3 means the mode is set. */
+			unsigned	mode = 0, val = 0, *cur = &mode;
+			size_t		j;
+
+			for (j = 3; j < end; j++) {
+				if (b[j] >= '0' && b[j] <= '9')
+					*cur = *cur * 10u + (unsigned)(b[j] - '0');
+				else if (b[j] == ';')
+					cur = &val;
+			}
+			if (mode == 1016)
+				h->pixel_mouse = (val == 1 || val == 3);
+		}
 		if (final == 'c' && b[2] == '?') {
 			size_t	j;
 			int	v = -1;
@@ -907,6 +990,15 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 		host_take(h, end + 1);
 		return (-1);
 	}
+
+    /* Focus reports are display state, not keyboard events. */
+    if (end == 2 && (final == 'I' || final == 'O')) {
+        memcpy(ev->data, b, 3);
+        ev->n = 3;
+        ev->type = DV_HEV_PTY;
+        host_take(h, 3);
+        return 1;
+    }
 
 	if (!parse_fields(b + 2, b + end, &f)) {
 		host_take(h, end + 1);
@@ -1053,7 +1145,7 @@ parse_one(struct dv_host *h, struct dv_host_ev *ev)
 int
 dv_host_pending(const struct dv_host *h)
 {
-	if (h->npend > 0 || h->in_osc || h->osc_ready)
+	if (h->pending.len > h->pending_pos || h->in_osc || h->osc_ready)
 		return (0);
 	if (h->len == 0)
 		return (0);
@@ -1085,10 +1177,10 @@ dv_host_next(struct dv_host *h, struct dv_host_ev *ev)
 {
 	int	r, n;
 
-	if (h->npend > 0) {
-		*ev = h->pend[0];
-		h->npend--;
-		memmove(&h->pend[0], &h->pend[1], h->npend * sizeof h->pend[0]);
+	if (h->pending.len > h->pending_pos) {
+		memcpy(ev, (const char *)h->pending.data + h->pending_pos, sizeof *ev);
+        h->pending_pos += sizeof *ev;
+        if (h->pending_pos == h->pending.len) { dv_buf_free(&h->pending); h->pending_pos = 0; }
 		return (1);
 	}
 	for (n = 0; n < 4096; n++) {
